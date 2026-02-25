@@ -4,6 +4,10 @@ local shipBody   -- 飞船刚体
 local shipVeh    -- 飞船载具
 local shipHealth = 100  -- 简单生命值：0~100
 
+-- 音频资源
+local engineLoop    -- 引擎循环音
+local moveSound     -- 推进音效
+
 local shipVelWorld = Vec(0, 0, 0)
 
 -- 准星相关：沿飞船正前方向投射一定距离，在屏幕上画一个十字
@@ -26,6 +30,11 @@ function init()
     shipVeh  = FindVehicle("ship")
     -- 在 xml 里：<body name="body" dynamic="true" tags="ship">
     shipBody = FindBody("ship")
+
+    -- 载入音频（相对当前 MOD 根目录）
+    -- 注意：Teardown 官方建议使用 ogg 格式，如果是其它格式请自行确认是否可用
+    engineLoop = LoadLoop("MOD/audio/engine.ogg")
+    moveSound  = LoadLoop("MOD/audio/move.ogg")
 end
 
 -- 处理玩家输入，返回“局部加速度”（不是速度）
@@ -202,21 +211,25 @@ local function updateShipCamera(isDriving, mx, my, wheel)
     end
 end
 
+-- 音频：引擎循环 & 推进音效
+local function updateShipAudio(isDriving, t)
+    if not isDriving then return end
 
-function tick(dt)
-    if not shipBody then return end
+    if engineLoop then
+        local engineVol = 1.0
+        PlayLoop(engineLoop, t.pos, engineVol)
+    end
 
-    -- 例如掉血测试，如果你有就保留
-    -- if InputPressed("k") then shipHealth = clamp(shipHealth - 20, 0, 100) end
+    if moveSound then
+        local speed = VecLength(shipVelWorld)
+        -- 音量完全由速度决定：speed=0 → 静音，speed 越大声音越大
+        local vol = clamp(speed / 30.0, 0.0, 5.0)
+        PlayLoop(moveSound, t.pos, vol)
+    end
+end
 
-    local alive = shipHealth > 0
-    local t = GetBodyTransform(shipBody)
-
-    local isDriving = (GetPlayerVehicle() == shipVeh) and alive
-
-    -------------------------------------------------
-    -- 右键：短按切换前/后视；在普通相机下长按进入自由观察
-    -------------------------------------------------
+-- 处理右键：短按切换前/后视；长按进入自由观察
+local function handleRightMouseInput(dt)
     if InputPressed("rmb") then
         rmbDown = true
         rmbHoldTime = 0
@@ -224,7 +237,6 @@ function tick(dt)
 
     if rmbDown then
         rmbHoldTime = rmbHoldTime + dt
-        -- 只有普通相机支持长按自由观察
         if (not camAtFront) and (rmbHoldTime >= longPressThreshold) and (not freeLookActive) then
             freeLookActive = true
         end
@@ -232,10 +244,8 @@ function tick(dt)
 
     if InputReleased("rmb") then
         if rmbHoldTime < longPressThreshold then
-            -- 短按：切换前/后视
             camAtFront = not camAtFront
 
-            -- 如果是从前置相机切回普通相机，直接把视角重置到默认后视位置
             if not camAtFront then
                 camTargetYaw   = aimYaw + camYawBack
                 camTargetPitch = aimPitch + camPitchBack
@@ -243,62 +253,42 @@ function tick(dt)
                 camPitch = camTargetPitch
             end
         end
-        -- 松开：退出自由观察（如果有），相机会平滑回到默认位置
+
         freeLookActive = false
         rmbDown = false
     end
+end
 
-    -- 鼠标输入（用于瞄准和相机）
-    local mx = InputValue("mousedx") or 0
-    local my = InputValue("mousedy") or 0
-    local wheel = InputValue("mousewheel") or 0
-
-    -- 不在自由观察时，鼠标直接改变“瞄准方向”，进而影响飞船朝向
-    if isDriving and not freeLookActive then
-        aimYaw   = aimYaw   - mx * mouseSensitivity
-        aimPitch = clamp(aimPitch - my * mouseSensitivity, -80, 80)
-
-        -- 限制水平方向：瞄准方向相对飞船左右偏角不能超过 maxYawOffset
-        -- 防止相机/瞄准在水平面上绕到飞船背后，产生抽搐般反转
-        local yawDiff = shortestAngleDiff(shipYaw, aimYaw)
-        yawDiff = clamp(yawDiff, -maxYawOffset, maxYawOffset)
-        aimYaw = shipYaw + yawDiff
+-- 更新瞄准方向（由鼠标控制）
+local function updateAimFromMouseInput(isDriving, mx, my)
+    if not isDriving or freeLookActive then
+        return
     end
 
-    local rotateShip = isDriving
+    aimYaw   = aimYaw   - mx * mouseSensitivity
+    aimPitch = clamp(aimPitch - my * mouseSensitivity, -80, 80)
 
-    -- 先根据瞄准方向更新飞船朝向（并写回 Transform）
-    t = updateShipRotationFromMouse(dt, rotateShip, t)
+    local yawDiff = shortestAngleDiff(shipYaw, aimYaw)
+    yawDiff = clamp(yawDiff, -maxYawOffset, maxYawOffset)
+    aimYaw = shipYaw + yawDiff
+end
 
-    -------------------------------------------------
-    -- 输入 → 加速度 → 速度（带阻尼的六向漂移）
-    -------------------------------------------------
+-- 输入 → 加速度 → 速度（带阻尼的六向漂移）
+local function updateShipMovement(dt, isDriving, t)
     local thrustAccel = 20          -- 推力加速度（越大加速越猛）
     local drag = 0.5                -- 阻尼系数（越大越容易减速）
 
-    -- 1) 输入得到“局部加速度”
     local localAcc = getInputLocalAcceleration(thrustAccel, isDriving)
-
-    -- 2) 转成世界加速度（考虑当前朝向）
     local accWorld = TransformToParentVec(t, localAcc)
 
-    -- 3) 积分得到世界速度
     shipVelWorld = VecAdd(shipVelWorld, VecScale(accWorld, dt))
 
-    -- 4) 简单线性阻尼：逐渐衰减速度
     local damp = math.max(0, 1 - drag * dt)
     shipVelWorld = VecScale(shipVelWorld, damp)
 
-    -- 5) 应用到刚体
     SetBodyVelocity(shipBody, shipVelWorld)
-
-    -- 旋转仍然完全由我们控制，防止物理乱转
     SetBodyAngularVelocity(shipBody, Vec(0, 0, 0))
-
-    -- 更新相机（跟随飞船）
-    updateShipCamera(isDriving, mx, my, wheel)
 end
-
 
 -- 绘制 HUD：在飞船正前方方向上画一个准星（与相机方向无关）
 function draw()
@@ -357,3 +347,36 @@ function draw()
     end
 
 end
+
+
+function tick(dt)
+    if not shipBody then return end
+
+    local alive = shipHealth > 0
+    local t = GetBodyTransform(shipBody)
+
+    local isDriving = (GetPlayerVehicle() == shipVeh) and alive
+
+    -- 音频
+    updateShipAudio(isDriving, t)
+
+    -- 右键状态
+    handleRightMouseInput(dt)
+
+    -- 鼠标输入（用于瞄准和相机）
+    local mx = InputValue("mousedx") or 0
+    local my = InputValue("mousedy") or 0
+    local wheel = InputValue("mousewheel") or 0
+
+    -- 更新瞄准方向与飞船朝向
+    updateAimFromMouseInput(isDriving, mx, my)
+    t = updateShipRotationFromMouse(dt, isDriving, t)
+
+    -- 根据输入更新飞船移动
+    updateShipMovement(dt, isDriving, t)
+
+    -- 更新相机（跟随飞船）
+    updateShipCamera(isDriving, mx, my, wheel)
+end
+
+
