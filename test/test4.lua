@@ -20,9 +20,29 @@ local function clamp(v, a, b)
     return v
 end
 
+local function normalizeAngleDeg(a)
+    return (a + 180) % 360 - 181
+end
+
 local function shortestAngleDiff(a, b)
     local d = (b - a + 180) % 360 - 180
     return d
+end
+
+local function getShipYaw(t)
+    local forward = TransformToParentVec(t, Vec(0, 0, -1))
+    forward = VecNormalize(forward)
+    local yawRaw = math.deg(math.atan2(-forward[3], forward[1]))
+    -- 调整 90 度，使得面向 -Z 时 yaw≈0，与相机坐标系对齐
+    return normalizeAngleDeg(yawRaw - 90.0)
+end
+
+local function getShipPitch(t)
+    local forward = TransformToParentVec(t, Vec(0, 0, -1))
+    forward = VecNormalize(forward)
+    local horiz = math.sqrt(forward[1] * forward[1] + forward[3] * forward[3])
+    local pitch = math.deg(math.atan2(forward[2], horiz))
+    return pitch
 end
 
 function init()
@@ -130,19 +150,28 @@ local function updateShipRotationFromMouse(dt, isDriving, t)
         return t
     end
 
-    -- 目标朝向：追随“瞄准方向”（由鼠标直接控制）
-    targetYaw = aimYaw
-    targetPitch = clamp(aimPitch, -maxPitch, maxPitch)
+    -- P 控制：根据当前朝向和目标朝向（相机/瞄准）之间的偏差设置角速度（水平 + 俯仰）
+    local currentYaw = getShipYaw(t)
+    local currentPitch = getShipPitch(t)
 
-    -- 飞船朝向慢慢追向目标朝向
-    local k = math.min(0.03, turnLerpSpeed * dt)
-    local dy = shortestAngleDiff(shipYaw, targetYaw)
-    shipYaw   = shipYaw   + dy * k
-    shipPitch = shipPitch + (targetPitch - shipPitch) * k
+    local yawError = shortestAngleDiff(currentYaw, aimYaw)
+    local pitchError = clamp(aimPitch - currentPitch, -maxPitch, maxPitch)
 
-    -- 用“当前飞船朝向”设旋转
-    t.rot = QuatEuler(shipPitch, shipYaw, 0)
-    SetBodyTransform(shipBody, t)
+    local kP_yaw = 2.0
+    local kP_pitch = 2.0
+    local maxYawSpeed = 90.0   -- 最大水平角速度（度/秒）
+    local maxPitchSpeed = 60.0 -- 最大俯仰角速度（度/秒）
+
+    local yawSpeedDeg = clamp(yawError * kP_yaw, -maxYawSpeed, maxYawSpeed)
+    local pitchSpeedDeg = clamp(pitchError * kP_pitch, -maxPitchSpeed, maxPitchSpeed)
+
+    local yawSpeedRad = yawSpeedDeg * math.pi / 180.0
+    local pitchSpeedRad = pitchSpeedDeg * math.pi / 180.0
+
+    -- 在机体局部坐标中：X 为俯仰，Y 为偏航
+    local localAngVel = Vec(pitchSpeedRad, yawSpeedRad, 0)
+    local worldAngVel = TransformToParentVec(t, localAngVel)
+    SetBodyAngularVelocity(shipBody, worldAngVel)
 
     return t
 end
@@ -179,12 +208,13 @@ local function updateShipCamera(isDriving, mx, my, wheel)
             if freeLookActive then
                 -- 普通相机 + 按住右键：自由观察，只改变相机角度，不动飞船朝向
                 camYaw   = camYaw   - mx * camRotateSensitivity
+                camYaw   = normalizeAngleDeg(camYaw)
                 camPitch = clamp(camPitch - my * camRotateSensitivity, -80, 80)
                 camTargetYaw   = camYaw
                 camTargetPitch = camPitch
             else
                 -- 普通相机：相机跟随“瞄准方向”，在背后略微偏上
-                camTargetYaw   = aimYaw + camYawBack
+                camTargetYaw   = normalizeAngleDeg(aimYaw + camYawBack)
                 -- 把相机俯仰限制在安全范围，避免视线几乎竖直导致 LookAt 翻滚
                 camTargetPitch = clamp(aimPitch + camPitchBack, -80, 80)
             end
@@ -192,6 +222,7 @@ local function updateShipCamera(isDriving, mx, my, wheel)
             -- 平滑插值到目标角度（包括从自由观察返回默认位置）
             local k = math.min(1.0, camLerpSpeed * GetTimeStep())
             camYaw   = camYaw   + (camTargetYaw   - camYaw)   * k
+            camYaw   = normalizeAngleDeg(camYaw)
             camPitch = camPitch + (camTargetPitch - camPitch) * k
 
             -- 计算相机世界位置：绕飞船公转
@@ -247,7 +278,7 @@ local function handleRightMouseInput(dt)
             camAtFront = not camAtFront
 
             if not camAtFront then
-                camTargetYaw   = aimYaw + camYawBack
+                camTargetYaw   = normalizeAngleDeg(aimYaw + camYawBack)
                 camTargetPitch = aimPitch + camPitchBack
                 camYaw   = camTargetYaw
                 camPitch = camTargetPitch
@@ -260,34 +291,56 @@ local function handleRightMouseInput(dt)
 end
 
 -- 更新瞄准方向（由鼠标控制）
-local function updateAimFromMouseInput(isDriving, mx, my)
+local function updateAimFromMouseInput(isDriving, mx, my, t)
     if not isDriving or freeLookActive then
         return
     end
 
     aimYaw   = aimYaw   - mx * mouseSensitivity
+    aimYaw   = normalizeAngleDeg(aimYaw)
     aimPitch = clamp(aimPitch - my * mouseSensitivity, -80, 80)
 
-    local yawDiff = shortestAngleDiff(shipYaw, aimYaw)
+    local currentYaw = getShipYaw(t)
+    local yawDiff = shortestAngleDiff(currentYaw, aimYaw)
     yawDiff = clamp(yawDiff, -maxYawOffset, maxYawOffset)
-    aimYaw = shipYaw + yawDiff
+    aimYaw = normalizeAngleDeg(currentYaw + yawDiff)
 end
 
--- 输入 → 加速度 → 速度（带阻尼的六向漂移）
 local function updateShipMovement(dt, isDriving, t)
-    local thrustAccel = 20          -- 推力加速度（越大加速越猛）
-    local drag = 0.5                -- 阻尼系数（越大越容易减速）
+    if not shipBody then return end
 
+    -- 以“力/冲量”的方式驱动刚体，让物理引擎自己积分速度
+    local thrustAccel = 20.0   -- 期望的推力加速度（越大越猛）
+    local mass = GetBodyMass(shipBody)
+
+    -- 永久向上的抗重力力：抵消重力，让飞船基本悬浮
+    local g = 10.0
+    local hoverAccel = g
+    local up = Vec(0, 1, 0)
+    local hoverImpulse = VecScale(up, mass * hoverAccel * dt)
+    ApplyBodyImpulse(shipBody, t.pos, hoverImpulse)
+
+    -- 推进：根据输入在机体前后方向施加冲量
     local localAcc = getInputLocalAcceleration(thrustAccel, isDriving)
-    local accWorld = TransformToParentVec(t, localAcc)
+    if localAcc[1] ~= 0 or localAcc[2] ~= 0 or localAcc[3] ~= 0 then
+        local accWorld = TransformToParentVec(t, localAcc)
+        -- 冲量 ≈ m * a * dt
+        local impulse = VecScale(accWorld, mass * dt)
+        ApplyBodyImpulse(shipBody, t.pos, impulse)
+    end
 
-    shipVelWorld = VecAdd(shipVelWorld, VecScale(accWorld, dt))
+    -- 简单的线性阻力：与当前速度方向相反，避免速度无限增大
+    local vel = GetBodyVelocity(shipBody)
+    local speed = VecLength(vel)
+    if speed > 0.001 then
+        local dragCoeff = 1
+        local dragImpulse = VecScale(vel, -mass * dragCoeff * dt)
+        ApplyBodyImpulse(shipBody, t.pos, dragImpulse)
+    end
 
-    local damp = math.max(0, 1 - drag * dt)
-    shipVelWorld = VecScale(shipVelWorld, damp)
+    -- 保存当前实际速度给音频等使用
+    shipVelWorld = GetBodyVelocity(shipBody)
 
-    SetBodyVelocity(shipBody, shipVelWorld)
-    SetBodyAngularVelocity(shipBody, Vec(0, 0, 0))
 end
 
 -- 绘制 HUD：在飞船正前方方向上画一个准星（与相机方向无关）
@@ -363,13 +416,15 @@ function tick(dt)
     -- 右键状态
     handleRightMouseInput(dt)
 
-    -- 鼠标输入（用于瞄准和相机）
+    -- 鼠标输入（用于旋转和相机）
     local mx = InputValue("mousedx") or 0
     local my = InputValue("mousedy") or 0
     local wheel = InputValue("mousewheel") or 0
 
-    -- 更新瞄准方向与飞船朝向
-    updateAimFromMouseInput(isDriving, mx, my)
+    -- 更新瞄准方向（轨道相机目标）
+    updateAimFromMouseInput(isDriving, mx, my, t)
+
+    -- 根据相机/瞄准方向差异设置角速度，让飞船平滑转向目标
     t = updateShipRotationFromMouse(dt, isDriving, t)
 
     -- 根据输入更新飞船移动

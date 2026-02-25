@@ -18,6 +18,10 @@
       pos="0.0 7.5 0.0"
       driven="false"
       sound=" "
+      topspeed="0"
+      acceleration="0"
+      damping="0"
+      strength="0"
     >
       <body name="body" tags="ship" pos="0.0 0.0 0.0" dynamic="true">
         <vox tags="player" pos="0.0 0.0 0.0" file="MOD/test/test4.vox" />
