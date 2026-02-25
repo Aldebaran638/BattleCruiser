@@ -4,7 +4,6 @@ local shipBody   -- 飞船刚体
 local shipVeh    -- 飞船载具
 local shipHealth = 100  -- 简单生命值：0~100
 
--- 飞船当前世界速度（由加速度积分出来）
 local shipVelWorld = Vec(0, 0, 0)
 
 -- 准星相关：沿飞船正前方向投射一定距离，在屏幕上画一个十字
@@ -101,6 +100,7 @@ local targetPitch = 0
 local mouseSensitivity = 0.15
 local maxPitch = 80
 local turnLerpSpeed = 5.0    -- 转向速度（越大越跟手，越小越“重”）
+local maxYawOffset = 120     -- 相机/瞄准方向相对飞船左右最大偏角（度），避免绕到背后导致翻转
 
 -- 右键状态：短按切换相机，长按（普通相机）自由观察
 local rmbDown = false
@@ -257,6 +257,12 @@ function tick(dt)
     if isDriving and not freeLookActive then
         aimYaw   = aimYaw   - mx * mouseSensitivity
         aimPitch = clamp(aimPitch - my * mouseSensitivity, -80, 80)
+
+        -- 限制水平方向：瞄准方向相对飞船左右偏角不能超过 maxYawOffset
+        -- 防止相机/瞄准在水平面上绕到飞船背后，产生抽搐般反转
+        local yawDiff = shortestAngleDiff(shipYaw, aimYaw)
+        yawDiff = clamp(yawDiff, -maxYawOffset, maxYawOffset)
+        aimYaw = shipYaw + yawDiff
     end
 
     local rotateShip = isDriving
@@ -304,25 +310,38 @@ function draw()
 
     local t = GetBodyTransform(shipBody)
 
-    -- 取飞船本地 -Z 方向（正前方），在这个方向上投射一定距离
-    local forwardLocal = Vec(0, 0, -1)
-    local forwardWorldPoint = TransformToParentPoint(t, VecScale(forwardLocal, crosshairDistance))
+    -------------------------------------------------
+    -- 1) 飞船朝向准星（十字）：瞄准飞船本体正对方向
+    -------------------------------------------------
+    do
+        -- 取飞船本地 -Z 方向（正前方），在这个方向上投射一定距离
+        local forwardLocal = Vec(0, 0, -1)
+        local forwardWorldPoint = TransformToParentPoint(t, VecScale(forwardLocal, crosshairDistance))
 
-    -- 将世界坐标转换到屏幕坐标
-    local sx, sy, visible = UiWorldToPixel(forwardWorldPoint)
-    if not sx or not sy or (visible == false) then
-        return
+        -- 只在“摄像机前方”时才画十字，避免在身后也出现
+        local camT = GetCameraTransform()
+        local camForward = TransformToParentVec(camT, Vec(0, 0, -1))
+        camForward = VecNormalize(camForward)
+        local dirToPoint = VecNormalize(VecSub(forwardWorldPoint, camT.pos))
+        local dot = VecDot(camForward, dirToPoint)
+
+        if dot > 0 then
+            -- 将世界坐标转换到屏幕坐标
+            local sx, sy = UiWorldToPixel(forwardWorldPoint)
+            if sx and sy then
+                UiPush()
+                    UiAlign("center middle")
+                    UiTranslate(sx, sy)
+                    UiColor(1, 1, 1, 1)
+                    local s = crosshairSize
+                    local th = 1
+                    -- 水平线
+                    UiRect(s * 2, th)
+                    -- 垂直线
+                    UiRect(th, s * 2)
+                UiPop()
+            end
+        end
     end
 
-    UiPush()
-        UiAlign("center middle")
-        UiTranslate(sx, sy)
-        UiColor(1, 1, 1, 1)
-        local s = crosshairSize
-        local th = 1
-        -- 水平线
-        UiRect(s * 2, th)
-        -- 垂直线
-        UiRect(th, s * 2)
-    UiPop()
 end
