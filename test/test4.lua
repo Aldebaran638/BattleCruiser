@@ -316,7 +316,19 @@ function draw()
     do
         -- 取飞船本地 -Z 方向（正前方），在这个方向上投射一定距离
         local forwardLocal = Vec(0, 0, -1)
-        local forwardWorldPoint = TransformToParentPoint(t, VecScale(forwardLocal, crosshairDistance))
+        -- 为了避免直接打到自己，从机体前方一点的位置开始发射射线
+        local rayOrigin = TransformToParentPoint(t, VecScale(forwardLocal, 2))
+        local forwardWorldDir = TransformToParentVec(t, forwardLocal)
+        forwardWorldDir = VecNormalize(forwardWorldDir)
+
+        -- 射线检测：如果一定距离内有障碍物，就用命中点；否则用固定距离点
+        local hit, hitDist = QueryRaycast(rayOrigin, forwardWorldDir, crosshairDistance)
+        local forwardWorldPoint
+        if hit then
+            forwardWorldPoint = VecAdd(rayOrigin, VecScale(forwardWorldDir, hitDist))
+        else
+            forwardWorldPoint = TransformToParentPoint(t, VecScale(forwardLocal, crosshairDistance))
+        end
 
         -- 只在“摄像机前方”时才画十字，避免在身后也出现
         local camT = GetCameraTransform()
