@@ -7,6 +7,10 @@ local shipHealth = 100  -- 简单生命值：0~100
 -- 飞船当前世界速度（由加速度积分出来）
 local shipVelWorld = Vec(0, 0, 0)
 
+-- 准星相关：沿飞船正前方向投射一定距离，在屏幕上画一个十字
+local crosshairDistance = 200
+local crosshairSize = 8
+
 local function clamp(v, a, b)
     if v < a then return a end
     if v > b then return b end
@@ -287,4 +291,38 @@ function tick(dt)
 
     -- 更新相机（跟随飞船）
     updateShipCamera(isDriving, mx, my, wheel)
+end
+
+
+-- 绘制 HUD：在飞船正前方方向上画一个准星（与相机方向无关）
+function draw()
+    if not shipBody then return end
+
+    local alive = shipHealth > 0
+    local isDriving = (GetPlayerVehicle() == shipVeh) and alive
+    if not isDriving then return end
+
+    local t = GetBodyTransform(shipBody)
+
+    -- 取飞船本地 -Z 方向（正前方），在这个方向上投射一定距离
+    local forwardLocal = Vec(0, 0, -1)
+    local forwardWorldPoint = TransformToParentPoint(t, VecScale(forwardLocal, crosshairDistance))
+
+    -- 将世界坐标转换到屏幕坐标
+    local sx, sy, visible = UiWorldToPixel(forwardWorldPoint)
+    if not sx or not sy or (visible == false) then
+        return
+    end
+
+    UiPush()
+        UiAlign("center middle")
+        UiTranslate(sx, sy)
+        UiColor(1, 1, 1, 1)
+        local s = crosshairSize
+        local th = 1
+        -- 水平线
+        UiRect(s * 2, th)
+        -- 垂直线
+        UiRect(th, s * 2)
+    UiPop()
 end
