@@ -10,6 +10,15 @@ local moveSound     -- 推进音效
 
 local shipVelWorld = Vec(0, 0, 0)
 
+-- 激光命中信息（供绘制和实际效果共用）
+local laserHitWorld = nil     -- 激光命中的世界坐标（仅当 laserDidHit=true 时有效）
+local laserDidHit  = false    -- 本帧射线是否打到了东西
+
+-- 激光发射参数（全局可调）
+local muzzleLocal   = Vec(0, 0, -6)   -- 飞船本地发射点
+local dirLocal      = Vec(0, 0, -1)   -- 飞船本地前方
+local maxDist       = 500             -- 激光最远距离（可自由调）
+
 -- 准星相关：沿飞船正前方向投射一定距离，在屏幕上画一个十字
 local crosshairDistance = 200
 local crosshairSize = 8
@@ -471,16 +480,38 @@ local function spawnLaserGlow(pos)
     end
 end
 
+-- 让激光真正产生效果（伤害/爆炸）的逻辑都集中在这里
+local function applyLaserImpact()
+    -- 只有当射线确实命中了东西且有合法命中点时才生效
+    if not laserDidHit or not laserHitWorld then
+        return
+    end
+
+    -------------------------------------------------
+    -- 可调参数：激光爆炸强度 / 范围
+    -- Explosion 第二个参数 size 取值大约 0.5 ~ 4.0：
+    --   数值越大，爆炸范围越大、破坏越强
+    -------------------------------------------------
+    local explosionSize = 4.0
+
+    Explosion(laserHitWorld, explosionSize)
+end
+
+-- 在 tick 中调用的激光效果更新（决定何时真正触发激光效果）
+local function updateLaserImpactFromTick(dt)
+    -- 这里示例为：按下左键瞬间，如果当前有命中点，则触发一次激光效果
+    if InputPressed("lmb") then
+        applyLaserImpact()
+    end
+end
+
 local function drawLaser()
     if not shipBody then return end
 
-    -- 激光发射参数（只需要改 maxDist，段数会自动跟随）
-    local muzzleLocal   = Vec(0, 0, -2)   -- 飞船本地发射点
-    local dirLocal      = Vec(0, 0, -1)    -- 飞船本地前方
-    local maxDist       = 100               -- 激光最远距离（可自由调）
-    local segLength     = 1.0              -- 每一小段的长度（越小越细腻）
+    -- 激光发射参数（段数会根据全局 maxDist 自动跟随）
+    local segLength     = 5.0              -- 每一小段的长度（越小越细腻）
     local segments      = math.max(1, math.floor(maxDist / segLength + 0.5))
-    local jitter        = 0.2              -- 随机闪烁幅度
+    local jitter        = 0.5              -- 随机闪烁幅度
 
     -- 简单 rndVec 函数
     local function rndVec(scale)
@@ -502,8 +533,13 @@ local function drawLaser()
     local hitWorld
     if hit then
         hitWorld = VecAdd(muzzleWorld, VecScale(VecNormalize(dirWorld), hitDist))
+        -- 记录全局命中信息，供其它逻辑使用
+        laserDidHit = true
+        laserHitWorld = hitWorld
     else
         hitWorld = VecAdd(muzzleWorld, VecScale(dirWorld, maxDist))
+        laserDidHit = false
+        laserHitWorld = nil
     end
 
     -- 只有按下左键才显示激光
@@ -561,6 +597,7 @@ end
 
 function tick(dt)
     updateShipTick(dt)
+    updateLaserImpactFromTick(dt)
 end
 
 
