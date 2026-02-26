@@ -45,7 +45,7 @@ local function getShipPitch(t)
     return pitch
 end
 
-function init()
+local function initShip()
     -- 在 xml 里：<vehicle name="ship" tags="boat ship" ...>
     shipVeh  = FindVehicle("ship")
     -- 在 xml 里：<body name="body" dynamic="true" tags="ship">
@@ -55,6 +55,10 @@ function init()
     -- 注意：Teardown 官方建议使用 ogg 格式，如果是其它格式请自行确认是否可用
     engineLoop = LoadLoop("MOD/audio/engine.ogg")
     moveSound  = LoadLoop("MOD/audio/move.ogg")
+end
+
+function init()
+    initShip()
 end
 
 -- 处理玩家输入，返回“局部加速度”（不是速度）
@@ -72,22 +76,6 @@ local function getInputLocalAcceleration(thrustAccel, isDriving)
     if InputDown("s") then
         localAcc = VecAdd(localAcc, Vec(0, 0,  thrustAccel))
     end
-
-    -- -- 左右（本地 X 轴）
-    -- if InputDown("a") then
-    --     localAcc = VecAdd(localAcc, Vec(-thrustAccel, 0, 0))
-    -- end
-    -- if InputDown("d") then
-    --     localAcc = VecAdd(localAcc, Vec( thrustAccel, 0, 0))
-    -- end
-
-    -- -- 上下（本地 Y 轴）：Shift 上升，Ctrl 下降
-    -- if InputDown("shift") then
-    --     localAcc = VecAdd(localAcc, Vec(0,  thrustAccel, 0))
-    -- end
-    -- if InputDown("ctrl") then
-    --     localAcc = VecAdd(localAcc, Vec(0, -thrustAccel, 0))
-    -- end
 
     return localAcc
 end
@@ -116,19 +104,10 @@ local camAtFront = false                -- 是否处于正前方视角
 
 local camRotateSensitivity = 0.12       -- 鼠标旋转灵敏度（改变轨道角度，仅自由观察时使用）
 
--- 玩家“瞄准方向”（由鼠标直接控制），飞船会缓慢追随这个方向
 local aimYaw   = 0
 local aimPitch = 0
-
-local shipYaw   = 0      -- 当前飞船朝向
-local shipPitch = 0
-
-local targetYaw   = 0    -- 鼠标想要的目标朝向
-local targetPitch = 0
-
 local mouseSensitivity = 0.15
 local maxPitch = 80
-local turnLerpSpeed = 5.0    -- 转向速度（越大越跟手，越小越“重”）
 local maxYawOffset = 120     -- 相机/瞄准方向相对飞船左右最大偏角（度），避免绕到背后导致翻转
 
 -- 右键状态：短按切换相机，长按（普通相机）自由观察
@@ -409,6 +388,61 @@ local function stabilizeShipRoll(dt, t)
     SetBodyAngularVelocity(shipBody, newAngVel)
 end
 
+-- 在屏幕中心前方绘制飞船准星 HUD
+local function drawShipHud()
+    if not shipBody then return end
+
+    local alive = shipHealth > 0
+    local isDriving = (GetPlayerVehicle() == shipVeh) and alive
+    if not isDriving then return end
+
+    local t = GetBodyTransform(shipBody)
+
+    -------------------------------------------------
+    -- 飞船朝向准星（十字）：瞄准飞船本体正对方向
+    -------------------------------------------------
+    -- 取飞船本地 -Z 方向（正前方），在这个方向上投射一定距离
+    local forwardLocal = Vec(0, 0, -1)
+    -- 为了避免直接打到自己，从机体前方一点的位置开始发射射线
+    local rayOrigin = TransformToParentPoint(t, VecScale(forwardLocal, 2))
+    local forwardWorldDir = TransformToParentVec(t, forwardLocal)
+    forwardWorldDir = VecNormalize(forwardWorldDir)
+
+    -- 射线检测：如果一定距离内有障碍物，就用命中点；否则用固定距离点
+    local hit, hitDist = QueryRaycast(rayOrigin, forwardWorldDir, crosshairDistance)
+    local forwardWorldPoint
+    if hit then
+        forwardWorldPoint = VecAdd(rayOrigin, VecScale(forwardWorldDir, hitDist))
+    else
+        forwardWorldPoint = TransformToParentPoint(t, VecScale(forwardLocal, crosshairDistance))
+    end
+
+    -- 只在“摄像机前方”时才画十字，避免在身后也出现
+    local camT = GetCameraTransform()
+    local camForward = TransformToParentVec(camT, Vec(0, 0, -1))
+    camForward = VecNormalize(camForward)
+    local dirToPoint = VecNormalize(VecSub(forwardWorldPoint, camT.pos))
+    local dot = VecDot(camForward, dirToPoint)
+
+    if dot > 0 then
+        -- 将世界坐标转换到屏幕坐标
+        local sx, sy = UiWorldToPixel(forwardWorldPoint)
+        if sx and sy then
+            UiPush()
+                UiAlign("center middle")
+                UiTranslate(sx, sy)
+                UiColor(1, 1, 1, 1)
+                local s = crosshairSize
+                local th = 1
+                -- 水平线
+                UiRect(s * 2, th)
+                -- 垂直线
+                UiRect(th, s * 2)
+            UiPop()
+        end
+    end
+end
+
 -- 在给定位置周围生成一小团发光粒子，用来伪造“激光在发光”的效果
 local function spawnLaserGlow(pos)
     -- 控制粒子偏移的半径：越大越“粗”/越散
@@ -485,66 +519,13 @@ local function drawLaser()
         end
     end
 end
--- 绘制 HUD：在飞船正前方方向上画一个准星（与相机方向无关）
+
 function draw()
-    if not shipBody then return end
-    -- 发射激光
-    drawLaser();
-    local alive = shipHealth > 0
-    local isDriving = (GetPlayerVehicle() == shipVeh) and alive
-    if not isDriving then return end
-
-    local t = GetBodyTransform(shipBody)
-
-    -------------------------------------------------
-    -- 1) 飞船朝向准星（十字）：瞄准飞船本体正对方向
-    -------------------------------------------------
-    do
-        -- 取飞船本地 -Z 方向（正前方），在这个方向上投射一定距离
-        local forwardLocal = Vec(0, 0, -1)
-        -- 为了避免直接打到自己，从机体前方一点的位置开始发射射线
-        local rayOrigin = TransformToParentPoint(t, VecScale(forwardLocal, 2))
-        local forwardWorldDir = TransformToParentVec(t, forwardLocal)
-        forwardWorldDir = VecNormalize(forwardWorldDir)
-
-        -- 射线检测：如果一定距离内有障碍物，就用命中点；否则用固定距离点
-        local hit, hitDist = QueryRaycast(rayOrigin, forwardWorldDir, crosshairDistance)
-        local forwardWorldPoint
-        if hit then
-            forwardWorldPoint = VecAdd(rayOrigin, VecScale(forwardWorldDir, hitDist))
-        else
-            forwardWorldPoint = TransformToParentPoint(t, VecScale(forwardLocal, crosshairDistance))
-        end
-
-        -- 只在“摄像机前方”时才画十字，避免在身后也出现
-        local camT = GetCameraTransform()
-        local camForward = TransformToParentVec(camT, Vec(0, 0, -1))
-        camForward = VecNormalize(camForward)
-        local dirToPoint = VecNormalize(VecSub(forwardWorldPoint, camT.pos))
-        local dot = VecDot(camForward, dirToPoint)
-
-        if dot > 0 then
-            -- 将世界坐标转换到屏幕坐标
-            local sx, sy = UiWorldToPixel(forwardWorldPoint)
-            if sx and sy then
-                UiPush()
-                    UiAlign("center middle")
-                    UiTranslate(sx, sy)
-                    UiColor(1, 1, 1, 1)
-                    local s = crosshairSize
-                    local th = 1
-                    -- 水平线
-                    UiRect(s * 2, th)
-                    -- 垂直线
-                    UiRect(th, s * 2)
-                UiPop()
-            end
-        end
-    end
-
+    drawLaser()
+    drawShipHud()
 end
 
-function tick(dt)
+local function updateShipTick(dt)
     if not shipBody then return end
 
     local alive = shipHealth > 0
@@ -576,7 +557,10 @@ function tick(dt)
 
     -- 更新相机（跟随飞船）
     updateShipCamera(isDriving, mx, my, wheel)
+end
 
+function tick(dt)
+    updateShipTick(dt)
 end
 
 
