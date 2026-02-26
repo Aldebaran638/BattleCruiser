@@ -19,6 +19,11 @@ local muzzleLocal   = Vec(0, 0, -6)   -- 飞船本地发射点
 local dirLocal      = Vec(0, 0, -1)   -- 飞船本地前方
 local maxDist       = 500             -- 激光最远距离（可自由调）
 
+-- 激光状态与冷却
+local laserShotActive   = false        -- 本帧是否需要绘制激光动画
+local laserCooldown     = {0, 0}       -- 双管激光冷却计时（秒）
+local laserCooldownTime = 1.0          -- 单次发射后的冷却时间（秒）
+
 -- 准星相关：沿飞船正前方向投射一定距离，在屏幕上画一个十字
 local crosshairDistance = 200
 local crosshairSize = 8
@@ -499,9 +504,27 @@ end
 
 -- 在 tick 中调用的激光效果更新（决定何时真正触发激光效果）
 local function updateLaserImpactFromTick(dt)
-    -- 这里示例为：按下左键瞬间，如果当前有命中点，则触发一次激光效果
-    if InputPressed("lmb") then
+    -- 冷却计时递减
+    for i = 1, 2 do
+        if laserCooldown[i] > 0 then
+            laserCooldown[i] = math.max(0, laserCooldown[i] - dt)
+        end
+    end
+
+    -- 检测“点击”（不是按住）左键
+    if not InputPressed("lmb") then
+        return
+    end
+
+    -- 优先使用第一个冷却槽，其次第二个
+    if laserCooldown[1] <= 0 then
+        laserShotActive = true
         applyLaserImpact()
+        laserCooldown[1] = laserCooldownTime
+    elseif laserCooldown[2] <= 0 then
+        laserShotActive = true
+        applyLaserImpact()
+        laserCooldown[2] = laserCooldownTime
     end
 end
 
@@ -542,22 +565,24 @@ local function drawLaser()
         laserHitWorld = nil
     end
 
-    -- 只有按下左键才显示激光
-    if InputDown("lmb") then
-        local last = muzzleWorld
-        for i = 1, segments do
-            local t = i / segments
-            local p = VecLerp(muzzleWorld, hitWorld, t)
-            p = VecAdd(p, rndVec(jitter * t))  -- 可选随机偏移，制造闪烁效果
-            DrawLine(last, p, 1, 1, 1)      -- DrawLine(from, to, thickness, r, g, b)
-            spawnLaserGlow(p)
-            last = p
-        end
+    -- 绘制激光（是否调用由外部状态 laserShotActive 决定）
+    local last = muzzleWorld
+    for i = 1, segments do
+        local t = i / segments
+        local p = VecLerp(muzzleWorld, hitWorld, t)
+        p = VecAdd(p, rndVec(jitter * t))  -- 可选随机偏移，制造闪烁效果
+        DrawLine(last, p, 1, 1, 1)      -- DrawLine(from, to, thickness, r, g, b)
+        spawnLaserGlow(p)
+        last = p
     end
 end
 
 function draw()
-    drawLaser()
+    if laserShotActive then
+        drawLaser()
+        -- 当前帧绘制完毕后复位标记，下次需要再次由 tick 置位
+        laserShotActive = false
+    end
     drawShipHud()
 end
 
