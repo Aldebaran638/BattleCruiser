@@ -409,10 +409,58 @@ local function stabilizeShipRoll(dt, t)
     SetBodyAngularVelocity(shipBody, newAngVel)
 end
 
+local function drawLaser()
+    if not shipBody then return end
+
+    -- 激光发射参数（只需要改 maxDist，段数会自动跟随）
+    local muzzleLocal   = Vec(0, 0, -6)   -- 飞船本地发射点
+    local dirLocal      = Vec(0, 0, -1)    -- 飞船本地前方
+    local maxDist       = 100               -- 激光最远距离（可自由调）
+    local segLength     = 1.0              -- 每一小段的长度（越小越细腻）
+    local segments      = math.max(1, math.floor(maxDist / segLength + 0.5))
+    local jitter        = 0.2              -- 随机闪烁幅度
+
+    -- 简单 rndVec 函数
+    local function rndVec(scale)
+        return Vec(
+            (math.random() - 0.5) * 2 * scale,
+            (math.random() - 0.5) * 2 * scale,
+            (math.random() - 0.5) * 2 * scale
+        )
+    end
+
+
+    -- 转换为世界坐标
+    local shipT = GetBodyTransform(shipBody)
+    local muzzleWorld = TransformToParentPoint(shipT, muzzleLocal)
+    local dirWorld    = TransformToParentVec(shipT, dirLocal)
+
+    -- 射线检测：如有命中则用命中点作为激光终点，避免穿墙
+    local hit, hitDist = QueryRaycast(muzzleWorld, VecNormalize(dirWorld), maxDist)
+    local hitWorld
+    if hit then
+        hitWorld = VecAdd(muzzleWorld, VecScale(VecNormalize(dirWorld), hitDist))
+    else
+        hitWorld = VecAdd(muzzleWorld, VecScale(dirWorld, maxDist))
+    end
+
+    -- 只有按下左键才显示激光
+    if InputDown("lmb") then
+        local last = muzzleWorld
+        for i = 1, segments do
+            local t = i / segments
+            local p = VecLerp(muzzleWorld, hitWorld, t)
+            p = VecAdd(p, rndVec(jitter * t))  -- 可选随机偏移，制造闪烁效果
+            DrawLine(last, p, 0.2, 0, 0)       -- DrawLine(from, to, thickness, r, g, b)
+            last = p
+        end
+    end
+end
 -- 绘制 HUD：在飞船正前方方向上画一个准星（与相机方向无关）
 function draw()
     if not shipBody then return end
-
+    -- 发射激光
+    drawLaser();
     local alive = shipHealth > 0
     local isDriving = (GetPlayerVehicle() == shipVeh) and alive
     if not isDriving then return end
@@ -467,7 +515,6 @@ function draw()
 
 end
 
-
 function tick(dt)
     if not shipBody then return end
 
@@ -500,6 +547,7 @@ function tick(dt)
 
     -- 更新相机（跟随飞船）
     updateShipCamera(isDriving, mx, my, wheel)
+
 end
 
 
