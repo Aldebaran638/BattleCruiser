@@ -409,11 +409,39 @@ local function stabilizeShipRoll(dt, t)
     SetBodyAngularVelocity(shipBody, newAngVel)
 end
 
+-- 在给定位置周围生成一小团发光粒子，用来伪造“激光在发光”的效果
+local function spawnLaserGlow(pos)
+    -- 控制粒子偏移的半径：越大越“粗”/越散
+    local radius = 0.4
+
+    -- 一次调用生成多颗粒子，形成持续的光晕感
+    for i = 1, 20 do
+        ParticleReset()              -- 重置粒子参数，避免继承上一次设置
+        ParticleType("plain")       -- 使用普通类型粒子
+        ParticleCollide(0)           -- 不参与物理碰撞，仅作视觉特效
+        ParticleRadius(0.03, 0.04)   -- 粒子半径：从 0.03 线性变化到 0.04（很细的点）
+        ParticleEmissive(20, 30)       -- 自发光很强，看起来非常亮
+        ParticleColor(0.5, 0, 1)     -- 粒子颜色：紫色（R,G,B）
+        ParticleGravity(0)           -- 不受重力影响，悬浮在原地
+        ParticleAlpha(0.5, 0.5)        -- 透明度从 0.2 逐渐衰减到 0，慢慢消失
+
+        -- 在线附近随机一点位置，让粒子分布在激光周围形成“粗光束”
+        local offset = Vec(
+            (math.random() - 0.5) * 2 * radius,
+            (math.random() - 0.5) * 2 * radius,
+            (math.random() - 0.5) * 2 * radius
+        )
+
+        -- 在 pos+offset 位置生成粒子，初速度为 0，生命周期 0.15 秒
+        SpawnParticle(VecAdd(pos, offset), Vec(0, 0, 0), 0.15)
+    end
+end
+
 local function drawLaser()
     if not shipBody then return end
 
     -- 激光发射参数（只需要改 maxDist，段数会自动跟随）
-    local muzzleLocal   = Vec(0, 0, -6)   -- 飞船本地发射点
+    local muzzleLocal   = Vec(0, 0, -2)   -- 飞船本地发射点
     local dirLocal      = Vec(0, 0, -1)    -- 飞船本地前方
     local maxDist       = 100               -- 激光最远距离（可自由调）
     local segLength     = 1.0              -- 每一小段的长度（越小越细腻）
@@ -423,9 +451,9 @@ local function drawLaser()
     -- 简单 rndVec 函数
     local function rndVec(scale)
         return Vec(
-            (math.random() - 0.5) * 2 * scale,
-            (math.random() - 0.5) * 2 * scale,
-            (math.random() - 0.5) * 2 * scale
+            (math.random() - 0.5) * 4 * scale,
+            (math.random() - 0.5) * 4 * scale,
+            (math.random() - 0.5) * 4 * scale
         )
     end
 
@@ -451,7 +479,8 @@ local function drawLaser()
             local t = i / segments
             local p = VecLerp(muzzleWorld, hitWorld, t)
             p = VecAdd(p, rndVec(jitter * t))  -- 可选随机偏移，制造闪烁效果
-            DrawLine(last, p, 0.2, 0, 0)       -- DrawLine(from, to, thickness, r, g, b)
+            DrawLine(last, p, 1, 1, 1)      -- DrawLine(from, to, thickness, r, g, b)
+            spawnLaserGlow(p)
             last = p
         end
     end
