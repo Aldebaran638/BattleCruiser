@@ -504,6 +504,17 @@ end
 
 -- 在 tick 中调用的激光效果更新（决定何时真正触发激光效果）
 local function updateLaserImpactFromTick(dt)
+    -- 前提条件：飞船存在且玩家正在驾驶该飞船
+    if (not shipBody) or (not shipVeh) then
+        return
+    end
+
+    local alive = shipHealth > 0
+    local isDriving = (GetPlayerVehicle() == shipVeh) and alive
+    if not isDriving then
+        return
+    end
+
     -- 冷却计时递减
     for i = 1, 2 do
         if laserCooldown[i] > 0 then
@@ -578,9 +589,20 @@ local function drawLaser()
 end
 
 function draw()
-    if laserShotActive then
+    -- 只有当飞船存在且玩家正在驾驶该飞船时才绘制激光
+    local canDrawLaser = false
+    if shipBody and shipVeh then
+        local alive = shipHealth > 0
+        local isDriving = (GetPlayerVehicle() == shipVeh) and alive
+        canDrawLaser = isDriving
+    end
+
+    if laserShotActive and canDrawLaser then
         drawLaser()
         -- 当前帧绘制完毕后复位标记，下次需要再次由 tick 置位
+        laserShotActive = false
+    else
+        -- 条件不满足时确保不会残留激光状态
         laserShotActive = false
     end
     drawShipHud()
