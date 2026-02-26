@@ -21,7 +21,7 @@ local function clamp(v, a, b)
 end
 
 local function normalizeAngleDeg(a)
-    return (a + 180) % 360 - 181
+    return (a + 180) % 360 - 180
 end
 
 local function shortestAngleDiff(a, b)
@@ -220,10 +220,12 @@ local function updateShipCamera(isDriving, mx, my, wheel)
             end
 
             -- 平滑插值到目标角度（包括从自由观察返回默认位置）
+            -- yaw 使用“最短角度差”插值，避免跨越 -180/180 度时突然整圈翻转
             local k = math.min(1.0, camLerpSpeed * GetTimeStep())
-            camYaw   = camYaw   + (camTargetYaw   - camYaw)   * k
-            camYaw   = normalizeAngleDeg(camYaw)
+            local yawDelta = shortestAngleDiff(camYaw, camTargetYaw)
+            camYaw   = normalizeAngleDeg(camYaw + yawDelta * k)
             camPitch = camPitch + (camTargetPitch - camPitch) * k
+            camPitch = clamp(camPitch, -80, 80)
 
             -- 计算相机世界位置：绕飞船公转
             local baseOffset = Vec(0, 0, camRadius)
