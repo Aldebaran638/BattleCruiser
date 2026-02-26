@@ -312,7 +312,7 @@ local function updateShipMovement(dt, isDriving, t)
     if not shipBody then return end
 
     -- 以“力/冲量”的方式驱动刚体，让物理引擎自己积分速度
-    local thrustAccel = 20.0   -- 期望的推力加速度（越大越猛）
+    local thrustAccel = 60.0   -- 期望的推力加速度（越大越猛）
     local mass = GetBodyMass(shipBody)
 
     -- 永久向上的抗重力力：抵消重力，让飞船基本悬浮
@@ -343,6 +343,70 @@ local function updateShipMovement(dt, isDriving, t)
     -- 保存当前实际速度给音频等使用
     shipVelWorld = GetBodyVelocity(shipBody)
 
+end
+
+-- Roll 稳定（PD 控制版）
+local shipRefUp = nil
+
+local function stabilizeShipRoll(dt, t)
+    if not shipBody then return end
+
+    -- 第一次记录参考“上方向”
+    if not shipRefUp then
+        local worldUp = Vec(0,1,0)
+        local currentUp = VecNormalize(TransformToParentVec(t, Vec(0,1,0)))
+
+        -- 确保参考方向永远朝世界上方，避免翻转
+        if VecDot(currentUp, worldUp) < 0 then
+            shipRefUp = VecScale(currentUp, -1)
+        else
+            shipRefUp = currentUp
+        end
+        return
+    end
+
+    -- 当前方向
+    local upNow = VecNormalize(TransformToParentVec(t, Vec(0,1,0)))
+    local forwardNow = VecNormalize(TransformToParentVec(t, Vec(0,0,-1)))
+
+    -- 误差轴
+    local errorAxis = VecCross(upNow, shipRefUp)
+
+    -- 只取绕 forward 的分量（即 roll）
+    local rollError = VecDot(errorAxis, forwardNow)
+
+    -- 小误差直接忽略，避免微抖
+    if math.abs(rollError) < 0.0005 then
+        return
+    end
+
+    -------------------------------------------------
+    -- PD 参数（你可以在这里调手感）
+    -------------------------------------------------
+    local kP = 42.0          -- 恢复强度（越大越猛）
+    local kD = 5.0           -- 阻尼强度（防震荡）
+    local stabilizationSpeed = 1.0  -- 全局倍率
+
+    -- 当前角速度
+    local angVel = GetBodyAngularVelocity(shipBody)
+    local currentRollSpeed = VecDot(angVel, forwardNow)
+
+    -- P 项：偏差越大 → 角速度越大
+    local desiredRollSpeed = rollError * kP * stabilizationSpeed
+
+    -- D 项：刹车
+    local damping = -currentRollSpeed * kD
+
+    -- 合成修正量
+    local rollCorrection = desiredRollSpeed + damping
+
+    -- 转成世界角速度向量
+    local correctionVec = VecScale(forwardNow, rollCorrection)
+
+    -- 叠加到当前角速度
+    local newAngVel = VecAdd(angVel, VecScale(correctionVec, dt))
+
+    SetBodyAngularVelocity(shipBody, newAngVel)
 end
 
 -- 绘制 HUD：在飞船正前方方向上画一个准星（与相机方向无关）
@@ -428,6 +492,8 @@ function tick(dt)
 
     -- 根据相机/瞄准方向差异设置角速度，让飞船平滑转向目标
     t = updateShipRotationFromMouse(dt, isDriving, t)
+    -- 飞船自动回正
+    stabilizeShipRoll(dt, t)
 
     -- 根据输入更新飞船移动
     updateShipMovement(dt, isDriving, t)
