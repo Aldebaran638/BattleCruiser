@@ -2,6 +2,8 @@
   <environment template="sunset" />
   <script file="main.lua" />
   <script file="sandbox.lua" />
+  <!-- 全局导弹管理脚本：控制所有 tags="missile" 的导弹 -->
+  <script file="MOD/missile/test5.lua" />
   <voxbox pos="-25.0 0.0 -25.0" size="500 1 500" color="1.0 1.0 1.0" />
   <voxbox
     name="EnigmaticCruiser"
