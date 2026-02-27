@@ -9,6 +9,7 @@ local engineLoop    -- 引擎循环音
 local moveSound     -- 推进音效
 local laserFireSounds = {}
 local laserHitSounds  = {}
+local missileLaunchSounds = {}
 
 local shipVelWorld = Vec(0, 0, 0)
 
@@ -86,6 +87,12 @@ local function initShip()
         LoadSound("MOD/audio/tachyon_lance_hit_01.ogg"),
         LoadSound("MOD/audio/tachyon_lance_hit_02.ogg"),
         LoadSound("MOD/audio/tachyon_lance_hit_03ogg.ogg"),
+    }
+
+    -- 导弹发射音效
+    missileLaunchSounds = {
+        LoadSound("MOD/audio/missile_fire_01.ogg"),
+        LoadSound("MOD/audio/missile_fire_02.ogg"),
     }
 end
 
@@ -524,6 +531,17 @@ local function spawnLaserGlow(pos)
     end
 end
 
+-- 导弹发射时随机播放一个音效
+local function playMissileLaunchSound(pos)
+    if not pos then return end
+    if #missileLaunchSounds == 0 then return end
+    local idx = math.random(1, #missileLaunchSounds)
+    local s = missileLaunchSounds[idx]
+    if s then
+        PlaySound(s, pos, 5.0)
+    end
+end
+
 -- 从飞船指定位置发射导弹
 local function spawnMissileFromShip()
     -- 需要飞船刚体存在
@@ -541,9 +559,27 @@ local function spawnMissileFromShip()
     -- 例如："MOD/missiles/homing_missile.xml"
     -------------------------------------------------
     local missileXmlPath = "MOD/missile/missile.xml"
+    -------------------------------------------------
+    -- 给导弹标记标签,防止锁敌自己
+    -------------------------------------------------
+    local handles = Spawn(missileXmlPath, missileT)
 
-    Spawn(missileXmlPath, missileT)
+    local missileBody = 0
+    for i=1,#handles do
+        if GetEntityType(handles[i]) == "body" then
+            missileBody = handles[i]
+            break
+        end
+    end
+
+    -- 标记导弹创建者
+    SetTag(missileBody, "owner_body", tostring(shipBody))
+
+    -- 导弹创建成功后播放发射音效
+    playMissileLaunchSound(missilePos)
 end
+
+
 
 -- 让激光真正产生效果（伤害/爆炸）的逻辑都集中在这里
 local function applyLaserImpact()
@@ -569,13 +605,12 @@ end
 local function updateMissileLaunchFromTick(dt)
     -- 需要有飞船实体
     if not shipBody then return end
-
+    DebugWatch("Press G to launch a missile", 0.5)
     -- 这里只检查按键，不区分大小写：Teardown 的按键名称使用小写 "g"
-    if not InputPressed("g") then
+    if InputPressed("g") then
+        spawnMissileFromShip()
         return
     end
-
-    spawnMissileFromShip()
 end
 
 -- 在 tick 中调用的激光效果更新（决定何时真正触发激光效果）

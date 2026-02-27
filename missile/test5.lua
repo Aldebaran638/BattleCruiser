@@ -26,13 +26,16 @@ local homingLost = false               -- 是否已经脱锁（脱锁后不再�
 local homingTargetPos = nil            -- 当前追踪的目标位置（锁定后每帧更新）
 local homingInitialForward = nil       -- 锁定瞬间导弹的前向（用来限制最大转向角）
 
+-- 初速度配置（可调）
+local MISSILE_INITIAL_SPEED = 80.0
+
 -- 初始化，找到导弹
 function init()
-    missileBody = FindBody("missile", true)
+    missileBody = FindBody("missile", false)
     -- 这里的 "missileHead" 指的是 shape 的 tag，不是 name
-    missileHead = FindShape("missileHead", true)
+    missileHead = FindShape("missileHead", false)
     -- 这里的 "launcher" 也是 shape 的 tag
-    launcherShape = FindShape("launcher", true)
+    launcherShape = FindShape("launcher", false)
     if launcherShape ~= 0 then
         launcherBody0 = GetShapeBody(launcherShape)
     end
@@ -41,6 +44,8 @@ function init()
     if LAUNCHER_LOOP_PATH ~= "" then
         launcherLoop = LoadLoop(LAUNCHER_LOOP_PATH)
     end
+    -- 给导弹设置基础速度
+    SetBasicSpeed()
 end
 
 -- 给导弹施加沿局部前向的“力”（用冲量近似）
@@ -305,14 +310,40 @@ function UpdateLauncherSound()
     PlayLoop(launcherLoop, tShape.pos, volume)
 end
 
+
+
+function SetBasicSpeed()
+    if missileBody == 0 then return end
+
+    -- 导弹当前朝向（局部 -Z）作为初速度方向
+    local t = GetBodyTransform(missileBody)
+    local forward = TransformToParentVec(t, Vec(0, 0, -1))
+    forward = VecNormalize(forward)
+
+    -- 目标初速度
+    local targetVel = VecScale(forward, MISSILE_INITIAL_SPEED)
+
+    -- 用冲量把当前速度改到目标速度（一次性）
+    local curVel = GetBodyVelocity(missileBody)
+    local deltaVel = VecSub(targetVel, curVel)
+
+    local mass = GetBodyMass(missileBody)
+    local impulse = VecScale(deltaVel, mass)
+
+    local comLocal = GetBodyCenterOfMass(missileBody)
+    local comWorld = TransformToParentPoint(t, comLocal)
+    ApplyBodyImpulse(missileBody, comWorld, impulse)
+
+end
+
 -- tick 主循环
 function tick(dt)
     if missileBody == 0 then return end
-
     -- 只有当 launcher 这个玻璃块：
     -- 1）存在且尚未碎裂（IsShapeBroken 为 false）
     -- 2）仍然隶属于原来的导弹 body（没有在破坏中被转移到新 body）
     -- 时才给导弹施加向前推力
+
     local canThrust = true
     if launcherShape ~= 0 then
         if IsShapeBroken(launcherShape) then
@@ -329,10 +360,7 @@ function tick(dt)
         ApplyForwardForce(missileBody, THRUST, dt)
         ApplyUpwardForce(missileBody, G, dt)
     end
-
     exploExplosion()
-    UpdateHoming(missileBody, dt)
+    -- UpdateHoming(missileBody, dt)
     UpdateLauncherSound()
-    -- 调试显示
-    DebugWatch("missileHead", missileHead+100)
 end
