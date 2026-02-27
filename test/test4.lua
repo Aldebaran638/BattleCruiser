@@ -508,7 +508,7 @@ local function spawnLaserGlow(pos)
         ParticleCollide(0)           -- 不参与物理碰撞，仅作视觉特效
         ParticleRadius(0.03, 0.04)   -- 粒子半径：从 0.03 线性变化到 0.04（很细的点）
         ParticleEmissive(20, 30)       -- 自发光很强，看起来非常亮
-        ParticleColor(0.5, 0, 1)     -- 粒子颜色：紫色（R,G,B）
+    ParticleColor(0.0, 0.1, 1.0) -- 颜色：蓝色，略微变化
         ParticleGravity(0)           -- 不受重力影响，悬浮在原地
         ParticleAlpha(0.5, 0.5)        -- 透明度从 0.2 逐渐衰减到 0，慢慢消失
 

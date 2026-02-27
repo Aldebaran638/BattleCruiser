@@ -8,7 +8,7 @@ local G = 10.0  -- 重力加速度
 
 -- launcher 音乐相关
 -- TODO: 把下面这个路径改成你实际的音乐文件路径
-local LAUNCHER_LOOP_PATH = "MOD/sound/launcher_loop.ogg"
+local LAUNCHER_LOOP_PATH = "MOD/audio/launcher_loop.ogg"
 local launcherLoop = 0
 local LAUNCHER_MIN_VOLUME = 0.2
 local LAUNCHER_MAX_VOLUME = 3.0
