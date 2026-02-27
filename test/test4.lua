@@ -25,6 +25,61 @@ local maxDist       = 500             -- 激光最远距离（可自由调）
 -- 导弹发射挂点（飞船本地坐标）
 local missileSpawnLocal = Vec(0, 8, 0)
 
+-- 导弹仰角限制（度），相对飞船本地 Y 轴，正负对称
+-- 修改这个值即可调整允许的仰俯角范围
+local missilePitchLimit = 30.0
+
+-- 相机状态（需要在 getMissileLaunchDirection 之前声明，否则闭包无法捕获）
+local camAtFront   = false   -- 是否处于正前方视角
+local camPitchBack = -20     -- 后置相机基准俯仰角（度）
+
+-- 获取导弹发射方向（世界坐标）
+-- 规则：X/Z 分量完全跟随摄像机朝向，Y 仰角限制在 [-missilePitchLimit, +missilePitchLimit]
+local function getMissileLaunchDirection()
+    if not shipBody then return Vec(0, 0, -1) end
+
+    local shipT  = GetBodyTransform(shipBody)
+    local camT   = GetCameraTransform()
+
+    -- 摄像机前向（世界坐标）
+    local camForward = VecNormalize(TransformToParentVec(camT, Vec(0, 0, -1)))
+
+    -- 转换到飞船本地坐标系
+    local localDir = TransformToLocalVec(shipT, camForward)
+
+    -- 在本地坐标系下计算水平分量长度（X-Z 平面）和仰角
+    local horzLen  = math.sqrt(localDir[1]*localDir[1] + localDir[3]*localDir[3])
+    local elevation = math.deg(math.atan2(localDir[2], horzLen))
+
+    -- 后置相机模式下，补偿摄像机基准仰角偏移
+    -- 例如 camPitchBack=-20 时，摄像机默认俯视 -20°，导弹应朝 0° 发射
+    if not camAtFront then
+        elevation = elevation - camPitchBack
+    end
+
+    -- 限制仰角到合法范围
+    elevation = math.max(-missilePitchLimit, math.min(missilePitchLimit, elevation))
+    local elevRad = math.rad(elevation)
+
+    -- 用夹角后的仰角重建本地方向向量，保持原来的 X-Z 比例
+    local newLocalDir
+    if horzLen < 0.0001 then
+        -- 摄像机几乎指向飞船正上/下方，水平分量接近 0，取飞船正前方（-Z）作为水平基准
+        newLocalDir = Vec(0, math.sin(elevRad), -math.cos(elevRad))
+    else
+        local hx = localDir[1] / horzLen
+        local hz = localDir[3] / horzLen
+        newLocalDir = Vec(
+            hx * math.cos(elevRad),
+            math.sin(elevRad),
+            hz * math.cos(elevRad)
+        )
+    end
+
+    -- 转换回世界坐标并返回
+    return VecNormalize(TransformToParentVec(shipT, newLocalDir))
+end
+
 -- 激光状态与冷却
 local laserShotActive   = false        -- 本帧是否需要绘制激光动画
 local laserCooldown     = {0, 0}       -- 双管激光冷却计时（秒）
@@ -133,13 +188,13 @@ local camPitch         = -20             -- 当前相机绕飞船的俯仰角（
 
 -- 背后视角的基准角度（前置相机不再使用偏移角）
 local camYawBack       = 0
-local camPitchBack     = -20
+camPitchBack           = -20  -- 已在顶部声明，此处仅赋值
 
 -- 目标角度（用于平滑插值）
 local camTargetYaw     = camYawBack
 local camTargetPitch   = camPitchBack
 
-local camAtFront = false                -- 是否处于正前方视角
+camAtFront = false              -- 已在顶部声明，此处仅赋值
 
 local camRotateSensitivity = 0.12       -- 鼠标旋转灵敏度（改变轨道角度，仅自由观察时使用）
 
@@ -551,7 +606,9 @@ local function spawnMissileFromShip()
 
     -- 计算导弹生成的世界位置和朝向
     local missilePos = TransformToParentPoint(shipT, missileSpawnLocal)
-    local missileRot = shipT.rot  -- 默认跟随飞船当前朝向
+    -- 朝向由摄像机方向决定（仰角已限制在 missilePitchLimit 范围内）
+    local launchDir  = getMissileLaunchDirection()
+    local missileRot = QuatLookAt(missilePos, VecAdd(missilePos, launchDir))
     local missileT   = Transform(missilePos, missileRot)
 
     -------------------------------------------------
@@ -602,9 +659,9 @@ local function applyLaserImpact()
 end
 
 -- 在 tick 中处理导弹发射输入（G 键）
-local function updateMissileLaunchFromTick(dt)
+local function updateMissileLaunchFromTick(isDriving, dt)
     -- 需要有飞船实体
-    if not shipBody then return end
+    if not shipBody or not isDriving then return end
     DebugWatch("Press G to launch a missile", 0.5)
     -- 这里只检查按键，不区分大小写：Teardown 的按键名称使用小写 "g"
     if InputPressed("g") then
@@ -759,12 +816,14 @@ local function updateShipTick(dt)
 
     -- 更新相机（跟随飞船）
     updateShipCamera(isDriving, mx, my, wheel)
+    
+    updateMissileLaunchFromTick(isDriving, dt)
 end
 
 function tick(dt)
     updateShipTick(dt)
     updateLaserImpactFromTick(dt)
-    updateMissileLaunchFromTick(dt)
+
 end
 
 
