@@ -21,6 +21,9 @@ local muzzleLocal   = Vec(0, 0, -6)   -- 飞船本地发射点
 local dirLocal      = Vec(0, 0, -1)   -- 飞船本地前方
 local maxDist       = 500             -- 激光最远距离（可自由调）
 
+-- 导弹发射挂点（飞船本地坐标）
+local missileSpawnLocal = Vec(0, 8, 0)
+
 -- 激光状态与冷却
 local laserShotActive   = false        -- 本帧是否需要绘制激光动画
 local laserCooldown     = {0, 0}       -- 双管激光冷却计时（秒）
@@ -521,6 +524,27 @@ local function spawnLaserGlow(pos)
     end
 end
 
+-- 从飞船指定位置发射导弹
+local function spawnMissileFromShip()
+    -- 需要飞船刚体存在
+    if not shipBody then return end
+
+    local shipT = GetBodyTransform(shipBody)
+
+    -- 计算导弹生成的世界位置和朝向
+    local missilePos = TransformToParentPoint(shipT, missileSpawnLocal)
+    local missileRot = shipT.rot  -- 默认跟随飞船当前朝向
+    local missileT   = Transform(missilePos, missileRot)
+
+    -------------------------------------------------
+    -- 在这里填入你自己的导弹 XML 路径
+    -- 例如："MOD/missiles/homing_missile.xml"
+    -------------------------------------------------
+    local missileXmlPath = "MOD/missile/missile.xml"
+
+    Spawn(missileXmlPath, missileT)
+end
+
 -- 让激光真正产生效果（伤害/爆炸）的逻辑都集中在这里
 local function applyLaserImpact()
     -- 只有当射线确实命中了东西且有合法命中点时才生效
@@ -539,6 +563,19 @@ local function applyLaserImpact()
 
     -- 命中并产生爆炸时，在爆炸点播放命中音效
     playLaserWeaponSound("hit", laserHitWorld)
+end
+
+-- 在 tick 中处理导弹发射输入（G 键）
+local function updateMissileLaunchFromTick(dt)
+    -- 需要有飞船实体
+    if not shipBody then return end
+
+    -- 这里只检查按键，不区分大小写：Teardown 的按键名称使用小写 "g"
+    if not InputPressed("g") then
+        return
+    end
+
+    spawnMissileFromShip()
 end
 
 -- 在 tick 中调用的激光效果更新（决定何时真正触发激光效果）
@@ -692,6 +729,7 @@ end
 function tick(dt)
     updateShipTick(dt)
     updateLaserImpactFromTick(dt)
+    updateMissileLaunchFromTick(dt)
 end
 
 
