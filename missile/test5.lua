@@ -137,7 +137,7 @@ function UpdateHoming(body, dt)
         local dHead = VecLength(VecSub(playerPos, headT.pos))
         if dHead <= HOMING_DETONATE_RADIUS then
             detonated = true
-            Explosion(headT.pos, 3.0)
+            Explosion(headT.pos, 1.0)
             return
         end
     end
