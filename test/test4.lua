@@ -7,6 +7,8 @@ local shipHealth = 100  -- 简单生命值：0~100
 -- 音频资源
 local engineLoop    -- 引擎循环音
 local moveSound     -- 推进音效
+local laserFireSounds = {}
+local laserHitSounds  = {}
 
 local shipVelWorld = Vec(0, 0, 0)
 
@@ -69,6 +71,19 @@ local function initShip()
     -- 注意：Teardown 官方建议使用 ogg 格式，如果是其它格式请自行确认是否可用
     engineLoop = LoadLoop("MOD/audio/engine.ogg")
     moveSound  = LoadLoop("MOD/audio/move.ogg")
+
+    -- 激光武器音效资源
+    laserFireSounds = {
+        LoadSound("MOD/audio/tachyon_lance_fire_01.ogg"),
+        LoadSound("MOD/audio/tachyon_lance_fire_02.ogg"),
+        LoadSound("MOD/audio/tachyon_lance_fire_03.ogg"),
+    }
+
+    laserHitSounds = {
+        LoadSound("MOD/audio/tachyon_lance_hit_01.ogg"),
+        LoadSound("MOD/audio/tachyon_lance_hit_02.ogg"),
+        LoadSound("MOD/audio/tachyon_lance_hit_03ogg.ogg"),
+    }
 end
 
 function init()
@@ -251,6 +266,27 @@ local function updateShipAudio(isDriving, t)
         -- 音量完全由速度决定：speed=0 → 静音，speed 越大声音越大
         local vol = clamp(speed / 30.0, 0.0, 5.0)
         PlayLoop(moveSound, t.pos, vol)
+    end
+end
+
+-- 激光武器音效统一在这里随机播放
+local function playLaserWeaponSound(kind, pos)
+    if not pos then return end
+    local vol = 5.0
+    if kind == "fire" then
+        if #laserFireSounds == 0 then return end
+        local idx = math.random(1, #laserFireSounds)
+        local s = laserFireSounds[idx]
+        if s then
+            PlaySound(s, pos, vol)
+        end
+    elseif kind == "hit" then
+        if #laserHitSounds == 0 then return end
+        local idx = math.random(1, #laserHitSounds)
+        local s = laserHitSounds[idx]
+        if s then
+            PlaySound(s, pos, vol)
+        end
     end
 end
 
@@ -500,6 +536,9 @@ local function applyLaserImpact()
     local explosionSize = 4.0
 
     Explosion(laserHitWorld, explosionSize)
+
+    -- 命中并产生爆炸时，在爆炸点播放命中音效
+    playLaserWeaponSound("hit", laserHitWorld)
 end
 
 -- 在 tick 中调用的激光效果更新（决定何时真正触发激光效果）
@@ -514,6 +553,10 @@ local function updateLaserImpactFromTick(dt)
     if not isDriving then
         return
     end
+
+    -- 预先计算当前发射位置（飞船局部 muzzleLocal 转世界）
+    local shipT = GetBodyTransform(shipBody)
+    local muzzleWorld = TransformToParentPoint(shipT, muzzleLocal)
 
     -- 冷却计时递减
     for i = 1, 2 do
@@ -530,10 +573,14 @@ local function updateLaserImpactFromTick(dt)
     -- 优先使用第一个冷却槽，其次第二个
     if laserCooldown[1] <= 0 then
         laserShotActive = true
+        -- 激光武器发射成功，在发射位置播放发射音效
+        playLaserWeaponSound("fire", muzzleWorld)
         applyLaserImpact()
         laserCooldown[1] = laserCooldownTime
     elseif laserCooldown[2] <= 0 then
         laserShotActive = true
+        -- 第二门激光发射成功，同样播放一次发射音效
+        playLaserWeaponSound("fire", muzzleWorld)
         applyLaserImpact()
         laserCooldown[2] = laserCooldownTime
     end
