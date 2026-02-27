@@ -23,7 +23,7 @@ local dirLocal      = Vec(0, 0, -1)   -- 飞船本地前方
 local maxDist       = 500             -- 激光最远距离（可自由调）
 
 -- 导弹发射挂点（飞船本地坐标）
-local missileSpawnLocal = Vec(0, 8, 0)
+local missileSpawnLocal = Vec(0, 9, 0)
 
 -- 导弹仰角限制（度），相对飞船本地 Y 轴，正负对称
 -- 修改这个值即可调整允许的仰俯角范围
