@@ -27,7 +27,7 @@ local homingTargetPos = nil            -- 当前追踪的目标位置（锁定�
 local homingInitialForward = nil       -- 锁定瞬间导弹的前向（用来限制最大转向角）
 
 -- 初速度配置（可调）
-local MISSILE_INITIAL_SPEED = 80.0
+local MISSILE_INITIAL_SPEED = 10.0
 
 -- 初始化，找到导弹
 function init()
