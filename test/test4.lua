@@ -322,7 +322,7 @@ local function updateShipAudio(isDriving, t)
     if not isDriving then return end
 
     if engineLoop then
-        local engineVol = 1.0
+        local engineVol = 10.0
         PlayLoop(engineLoop, t.pos, engineVol)
     end
 
