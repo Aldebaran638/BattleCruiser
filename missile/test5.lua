@@ -164,8 +164,21 @@ end
 -- 爆炸半径（可调）
 local whirlwindMissiles_hit_explosionSize = 3.0
 
--- 防止同一个 missileHead 重复触发爆炸
-local whirlwindMissiles_hit_detonatedByHead = {}
+-- 引信保险时间（秒）：防止刚 Spawn 就撞到自身/发射器导致立刻爆
+local whirlwindMissiles_hit_armTime = 0.15
+
+-- 使用 tag 给每个弹头分配稳定 uid，避免句柄复用导致的“奇数炸偶数不炸”
+local whirlwindMissiles_hit_uidTag = "whirlwindMissiles_hit_uid"
+
+-- 标记是否已引爆（shape/body tag）
+local whirlwindMissiles_hit_detonatedTag = "whirlwindMissiles_hit_detonated"
+local whirlwindMissiles_hit_detonatedBodyTag = "whirlwindMissiles_detonated"
+
+-- 弹头状态（uid -> st）
+-- st = { t=number, lastPos=Vec, hasLast=bool }
+local whirlwindMissiles_hit_stateByUid = {}
+
+-- （去重 tag 已在上方声明）
 
 
 
@@ -174,21 +187,109 @@ local function whirlwindMissiles_hit_findHeads ()
     return FindShapes("missileHead", false) or {}
 end
 
--- whirlwindMissiles_hit_explodeIfBroken 描述：若 missileHeadShape 已碎裂，则在当前位置爆炸一次
-local function whirlwindMissiles_hit_explodeIfBroken (missileHeadShape)
-    if missileHeadShape == 0 then
+-- whirlwindMissiles_hit_getOrAssignUid 描述：为弹头 shape 获取/分配稳定 uid（存到 tag）
+local function whirlwindMissiles_hit_getOrAssignUid (missileHeadShape)
+    local uid = GetTagValue(missileHeadShape, whirlwindMissiles_hit_uidTag)
+    if uid and uid ~= "" then
+        return uid
+    end
+
+    uid = tostring(missileHeadShape) .. "_" .. tostring(math.random(100000, 999999))
+    SetTag(missileHeadShape, whirlwindMissiles_hit_uidTag, uid)
+    return uid
+end
+
+-- whirlwindMissiles_hit_markDetonated 描述：给弹头/导弹打上已引爆标记，并移除 missileHead tag 防止重复扫描
+local function whirlwindMissiles_hit_markDetonated (missileHeadShape, missileBody)
+    SetTag(missileHeadShape, whirlwindMissiles_hit_detonatedTag)
+    if missileBody and missileBody ~= 0 then
+        SetTag(missileBody, whirlwindMissiles_hit_detonatedBodyTag)
+    end
+    pcall(RemoveTag, missileHeadShape, "missileHead")
+end
+
+-- whirlwindMissiles_hit_tryDetonateAt 描述：在指定位置引爆一次（并标记）
+local function whirlwindMissiles_hit_tryDetonateAt (missileHeadShape, missileBody, pos)
+    if not pos then
         return
     end
-    if whirlwindMissiles_hit_detonatedByHead[missileHeadShape] then
+    if HasTag(missileHeadShape, whirlwindMissiles_hit_detonatedTag) then
         return
     end
-    if not IsShapeBroken(missileHeadShape) then
+    if missileBody and missileBody ~= 0 and HasTag(missileBody, whirlwindMissiles_hit_detonatedBodyTag) then
+        whirlwindMissiles_hit_markDetonated(missileHeadShape, missileBody)
         return
     end
 
-    whirlwindMissiles_hit_detonatedByHead[missileHeadShape] = true
-    local t = GetShapeWorldTransform(missileHeadShape)
-    Explosion(t.pos, whirlwindMissiles_hit_explosionSize)
+    whirlwindMissiles_hit_markDetonated(missileHeadShape, missileBody)
+    Explosion(pos, whirlwindMissiles_hit_explosionSize)
+end
+
+-- whirlwindMissiles_hit_updateOne 描述：扫掠射线引信（主）+ 碎裂引信（备）
+local function whirlwindMissiles_hit_updateOne (missileHeadShape, dt)
+    if missileHeadShape == 0 then
+        return
+    end
+
+    local missileBody = GetShapeBody(missileHeadShape)
+    if missileBody == 0 or (not HasTag(missileBody, "missile")) then
+        return
+    end
+
+    if HasTag(missileHeadShape, whirlwindMissiles_hit_detonatedTag) or HasTag(missileBody, whirlwindMissiles_hit_detonatedBodyTag) then
+        return
+    end
+
+    local uid = whirlwindMissiles_hit_getOrAssignUid(missileHeadShape)
+    local st = whirlwindMissiles_hit_stateByUid[uid]
+    if not st then
+        st = { t = 0, lastPos = Vec(0, 0, 0), hasLast = false }
+        whirlwindMissiles_hit_stateByUid[uid] = st
+    end
+
+    st.t = (st.t or 0) + (dt or 0)
+
+    local tNow = GetShapeWorldTransform(missileHeadShape)
+    local posNow = tNow.pos
+
+    -- 备选触发：弹头碎裂就立即爆（不依赖射线）
+    if IsShapeBroken(missileHeadShape) then
+        whirlwindMissiles_hit_tryDetonateAt(missileHeadShape, missileBody, posNow)
+        return
+    end
+
+    -- 保险期内：只记录位置，不做命中检测
+    if st.t < whirlwindMissiles_hit_armTime then
+        st.lastPos = posNow
+        st.hasLast = true
+        return
+    end
+
+    -- 扫掠射线：lastPos -> posNow
+    if not st.hasLast then
+        st.lastPos = posNow
+        st.hasLast = true
+        return
+    end
+
+    local delta = VecSub(posNow, st.lastPos)
+    local dist = VecLength(delta)
+    if dist < 0.001 then
+        st.lastPos = posNow
+        return
+    end
+
+    local dir = VecScale(delta, 1.0 / dist)
+    QueryRejectBody(missileBody)
+
+    local hit, hitDist = QueryRaycast(st.lastPos, dir, dist)
+    if hit then
+        local hitPos = VecAdd(st.lastPos, VecScale(dir, hitDist))
+        whirlwindMissiles_hit_tryDetonateAt(missileHeadShape, missileBody, hitPos)
+        return
+    end
+
+    st.lastPos = posNow
 end
 
 -- whirlwindMissiles_hit_server_tick 描述：服务端 tick（检测弹头碎裂并爆炸）
@@ -199,12 +300,92 @@ local function whirlwindMissiles_hit_server_tick (dt)
     end
 
     for i = 1, #heads do
-        whirlwindMissiles_hit_explodeIfBroken(heads[i])
+        whirlwindMissiles_hit_updateOne(heads[i], dt)
     end
 end
 
 ------------------------------------------------
 -- whirlwindMissiles_hit 模块 结束
+------------------------------------------------
+
+------------------------------------------------
+-- whirlwindMissiles_selfDestruct 模块 开始
+------------------------------------------------
+
+-- 最大存活时间（秒）：飞太久自动自毁
+local whirlwindMissiles_selfDestruct_maxLife = 12.0
+
+-- 自毁爆炸半径（可调；可与 hit 的爆炸半径不同）
+local whirlwindMissiles_selfDestruct_explosionSize = 3.0
+
+-- 使用 tag 给每个导弹 body 分配稳定 uid，避免句柄复用导致的状态串号
+local whirlwindMissiles_selfDestruct_uidTag = "whirlwindMissiles_selfDestruct_uid"
+
+-- 导弹状态（uid -> t）
+local whirlwindMissiles_selfDestruct_timeByUid = {}
+
+
+
+-- whirlwindMissiles_selfDestruct_findMissileBodies 描述：扫描场上所有导弹 body（tag: missile）
+local function whirlwindMissiles_selfDestruct_findMissileBodies ()
+    return FindBodies("missile", false) or {}
+end
+
+-- whirlwindMissiles_selfDestruct_getOrAssignUid 描述：为导弹 body 获取/分配稳定 uid（存到 tag）
+local function whirlwindMissiles_selfDestruct_getOrAssignUid (missileBody)
+    local uid = GetTagValue(missileBody, whirlwindMissiles_selfDestruct_uidTag)
+    if uid and uid ~= "" then
+        return uid
+    end
+
+    uid = tostring(missileBody) .. "_" .. tostring(math.random(100000, 999999))
+    SetTag(missileBody, whirlwindMissiles_selfDestruct_uidTag, uid)
+    return uid
+end
+
+-- whirlwindMissiles_selfDestruct_try 描述：若超时则在导弹当前位置自毁一次
+local function whirlwindMissiles_selfDestruct_try (missileBody, dt)
+    if missileBody == 0 then
+        return
+    end
+    if HasTag(missileBody, "whirlwindMissiles_detonated") then
+        return
+    end
+
+    local uid = whirlwindMissiles_selfDestruct_getOrAssignUid(missileBody)
+    local t = whirlwindMissiles_selfDestruct_timeByUid[uid]
+    if not t then
+        t = 0
+    end
+    t = t + (dt or 0)
+    whirlwindMissiles_selfDestruct_timeByUid[uid] = t
+
+    if t < whirlwindMissiles_selfDestruct_maxLife then
+        return
+    end
+
+    SetTag(missileBody, "whirlwindMissiles_detonated")
+
+    local tr = GetBodyTransform(missileBody)
+    local comLocal = GetBodyCenterOfMass(missileBody)
+    local comWorld = TransformToParentPoint(tr, comLocal)
+    Explosion(comWorld, whirlwindMissiles_selfDestruct_explosionSize)
+end
+
+-- whirlwindMissiles_selfDestruct_server_tick 描述：服务端 tick（扫描所有导弹并在超时后自毁）
+local function whirlwindMissiles_selfDestruct_server_tick (dt)
+    local missiles = whirlwindMissiles_selfDestruct_findMissileBodies()
+    if #missiles == 0 then
+        return
+    end
+
+    for i = 1, #missiles do
+        whirlwindMissiles_selfDestruct_try(missiles[i], dt)
+    end
+end
+
+------------------------------------------------
+-- whirlwindMissiles_selfDestruct 模块 结束
 ------------------------------------------------
 
 ------------------------------------------------
@@ -492,6 +673,7 @@ function server.tick (dt)
     whirlwindMissiles_promote_server_tick(dt)
     whirlwindMissiles_float_server_tick(dt)
     whirlwindMissiles_damping_server_tick(dt)
+    whirlwindMissiles_selfDestruct_server_tick(dt)
     whirlwindMissiles_hit_server_tick(dt)
 end
 
