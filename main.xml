@@ -23,8 +23,8 @@
 				<vox tags="engine" pos="0.1 -0.4 0.0" file="MOD/test/engine.vox"/>
 				<vox tags="engine" pos="0.4 -0.4 0.0" file="MOD/test/engine.vox"/>
 				<vox tags="engine" pos="0.7 -0.4 0.0" file="MOD/test/engine.vox"/>
-				<vox tags="smallThruster" pos="0.0 0.0 0.0" file="MOD/test/smallThruster.vox"/>
-				<vox tags="smallThruster" pos="0.0 0.0 0.0" file="MOD/test/smallThruster.vox"/>
+				<vox tags="smallThruster" pos="2.1 0.1 0.0" rot="0 0 180" file="MOD/test/smallThruster.vox"/>
+				<vox tags="smallThruster" pos="-2.1 -0.1 -0.0" file="MOD/test/smallThruster.vox"/>
 				<vox tags="secondaryLightSystem" pos="0.0 0.0 0.0" file="MOD/test/secondaryLightSystem.vox"/>
 				<vox tags="mainLightSystem" pos="0.0 0.0 0.0" file="MOD/test/mainLightSystem.vox"/>
 				<vox tags="armor" pos="0.0 0.0 0.0" file="MOD/test/armor.vox"/>

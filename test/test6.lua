@@ -1333,6 +1333,9 @@ end
 
 local fallenEmpireCruiser_camera_atFront = false
 
+-- 前置相机位置（飞船本地坐标）
+local fallenEmpireCruiser_camera_frontLocalOffset = Vec(0, 0, -4)
+
 local fallenEmpireCruiser_camera_radiusBack = 18
 local fallenEmpireCruiser_camera_radiusMin = 4
 local fallenEmpireCruiser_camera_radiusMax = 40
@@ -1345,6 +1348,15 @@ local fallenEmpireCruiser_camera_targetPitch = -20
 
 local fallenEmpireCruiser_camera_rotateSensitivity = 0.12
 local fallenEmpireCruiser_camera_lerpSpeed = 6
+
+-- 缓存上一帧的相机 Transform：避免在某些情况下 draw 阶段回落到游戏默认摄像机
+local fallenEmpireCruiser_camera_lastActive = false
+local fallenEmpireCruiser_camera_lastTransform = nil
+
+-- 从 tick 缓存“当前驾驶的飞船 body”，供 draw 阶段每帧计算相机用
+local fallenEmpireCruiser_camera_cachedIsDriving = false
+local fallenEmpireCruiser_camera_cachedBody = 0
+local fallenEmpireCruiser_camera_cachedDt = 0
 
 local function fallenEmpireCruiser_camera_yawPitchFromDir(dir)
     dir = VecNormalize(dir)
@@ -1397,11 +1409,34 @@ local function fallenEmpireCruiser_camera_shortestAngleDiff(from, to)
 end
 
 local function fallenEmpireCruiser_camera_handleRmb(dt)
+    -- 按下立刻切换前/后视，并在切入时立即用飞船朝向初始化 yaw/pitch/targets
     if InputPressed("rmb") then
         fallenEmpireCruiser_camera_rmbDown = true
         fallenEmpireCruiser_camera_rmbHoldTime = 0
+
+        if fallenEmpireCruiser_camera_atFront then
+            -- 已在前视，按下就切回后视
+            fallenEmpireCruiser_camera_atFront = false
+            fallenEmpireCruiser_camera_freeLookActive = false
+        else
+            -- 立刻切到前视，并立即用当前飞船朝向初始化相机方向（避免帧跳变）
+            fallenEmpireCruiser_camera_atFront = true
+            fallenEmpireCruiser_camera_freeLookActive = false
+
+            local body = fallenEmpireCruiser_camera_cachedBody
+            if body and body ~= 0 then
+                local shipT = GetBodyTransform(body)
+                local shipForward = VecNormalize(TransformToParentVec(shipT, Vec(0, 0, -1)))
+                local yaw, pitch = fallenEmpireCruiser_camera_yawPitchFromDir(shipForward)
+                fallenEmpireCruiser_camera_yaw = yaw
+                fallenEmpireCruiser_camera_pitch = pitch
+                fallenEmpireCruiser_camera_targetYaw = yaw
+                fallenEmpireCruiser_camera_targetPitch = pitch
+            end
+        end
     end
 
+    -- 处理长按进入 free-look（保持你原有的长按语义）
     if fallenEmpireCruiser_camera_rmbDown then
         fallenEmpireCruiser_camera_rmbHoldTime = fallenEmpireCruiser_camera_rmbHoldTime + (dt or 0)
         if (not fallenEmpireCruiser_camera_atFront)
@@ -1411,27 +1446,20 @@ local function fallenEmpireCruiser_camera_handleRmb(dt)
         end
     end
 
+    -- 释放时结束按下/长按状态
     if InputReleased("rmb") then
-        if fallenEmpireCruiser_camera_rmbHoldTime < fallenEmpireCruiser_camera_longPressThreshold then
-            fallenEmpireCruiser_camera_atFront = not fallenEmpireCruiser_camera_atFront
-            fallenEmpireCruiser_camera_freeLookActive = false
-
-            if fallenEmpireCruiser_camera_atFront then
-                fallenEmpireCruiser_camera_pendingInitToShipForward = true
-            else
-                fallenEmpireCruiser_camera_pendingInitToShipForward = false
-            end
-        else
-            fallenEmpireCruiser_camera_freeLookActive = false
-        end
         fallenEmpireCruiser_camera_rmbDown = false
         fallenEmpireCruiser_camera_rmbHoldTime = 0
+        if fallenEmpireCruiser_camera_freeLookActive then
+            fallenEmpireCruiser_camera_freeLookActive = false
+        end
     end
 end
 
 local function fallenEmpireCruiser_camera_update(isDriving, body, dt)
     if not isDriving or not body or body == 0 then
-        AttachCameraTo(0)
+        fallenEmpireCruiser_camera_lastActive = false
+        fallenEmpireCruiser_camera_lastTransform = nil
         return
     end
 
@@ -1439,15 +1467,18 @@ local function fallenEmpireCruiser_camera_update(isDriving, body, dt)
 
     fallenEmpireCruiser_camera_handleRmb(dt)
 
+    local didInitToShipForward = false
+
     -- 切到前置相机的同一帧就初始化朝向，避免出现一帧跳变
     if fallenEmpireCruiser_camera_atFront and fallenEmpireCruiser_camera_pendingInitToShipForward then
         local shipForward = VecNormalize(TransformToParentVec(shipT, Vec(0, 0, -1)))
         local yaw, pitch = fallenEmpireCruiser_camera_yawPitchFromDir(shipForward)
-        fallenEmpireCruiser_camera_yaw = yaw
-        fallenEmpireCruiser_camera_pitch = pitch
-        fallenEmpireCruiser_camera_targetYaw = yaw
-        fallenEmpireCruiser_camera_targetPitch = pitch
+        fallenEmpireCruiser_camera_yaw = -yaw
+        fallenEmpireCruiser_camera_pitch = -pitch
+        fallenEmpireCruiser_camera_targetYaw = -yaw
+        fallenEmpireCruiser_camera_targetPitch = -pitch
         fallenEmpireCruiser_camera_pendingInitToShipForward = false
+        didInitToShipForward = true
     end
 
     local mx = InputValue("mousedx") or 0
@@ -1458,14 +1489,16 @@ local function fallenEmpireCruiser_camera_update(isDriving, body, dt)
     local camRot
 
     if fallenEmpireCruiser_camera_atFront then
-        -- 前置相机：位置固定在飞船前方，但允许用鼠标旋转朝向（用作瞄准/转向输入）
-        local localOffset = Vec(0, 0, -6)
-        camPos = TransformToParentPoint(shipT, localOffset)
+        -- 前置相机：短按右键切入时，立即对齐“飞船朝向”；位置固定在飞船本地 (0,0,-4)
+        camPos = TransformToParentPoint(shipT, fallenEmpireCruiser_camera_frontLocalOffset)
         local sens = fallenEmpireCruiser_camera_rotateSensitivity
 
-        -- 前置相机：水平转动方向与后置一致（修正反向问题）
-        fallenEmpireCruiser_camera_targetYaw = fallenEmpireCruiser_camera_normalizeAngleDeg(fallenEmpireCruiser_camera_targetYaw + mx * sens)
-        fallenEmpireCruiser_camera_targetPitch = fallenEmpireCruiser_camera_clamp(fallenEmpireCruiser_camera_targetPitch - my * sens, -80, 80)
+        -- 切换到前置相机的这一帧：忽略鼠标微抖，确保“方向一定是飞船朝向方向”
+        if not didInitToShipForward then
+            -- 前置相机转动逻辑与后置一致
+            fallenEmpireCruiser_camera_targetYaw = fallenEmpireCruiser_camera_normalizeAngleDeg(fallenEmpireCruiser_camera_targetYaw + mx * sens)
+            fallenEmpireCruiser_camera_targetPitch = fallenEmpireCruiser_camera_clamp(fallenEmpireCruiser_camera_targetPitch - my * sens, -80, 80)
+        end
 
         local k = math.min(1.0, fallenEmpireCruiser_camera_lerpSpeed * (dt or 0))
         local yawDelta = fallenEmpireCruiser_camera_shortestAngleDiff(fallenEmpireCruiser_camera_yaw, fallenEmpireCruiser_camera_targetYaw)
@@ -1509,13 +1542,33 @@ local function fallenEmpireCruiser_camera_update(isDriving, body, dt)
     end
 
     AttachCameraTo(0)
-    SetCameraTransform(Transform(camPos, camRot))
+    local camT = Transform(camPos, camRot)
+    fallenEmpireCruiser_camera_lastActive = true
+    fallenEmpireCruiser_camera_lastTransform = camT
+    SetCameraTransform(camT)
 end
 
 function fallenEmpireCruiser_camera_client_tick(dt)
     local isDriving, _, body = fallenEmpireCruiser_localShip_get()
 
+    fallenEmpireCruiser_camera_cachedIsDriving = isDriving
+    fallenEmpireCruiser_camera_cachedBody = body or 0
+    fallenEmpireCruiser_camera_cachedDt = dt or 0
+
+    -- tick 阶段设置一次相机：Teardown 的主视角通常以 tick 为准
     fallenEmpireCruiser_camera_update(isDriving, body, dt)
+end
+
+function fallenEmpireCruiser_camera_client_draw()
+    -- draw 阶段再补一次：防止引擎/其他 UI 绘制阶段覆写相机
+    if not fallenEmpireCruiser_camera_lastActive then
+        return
+    end
+    if not fallenEmpireCruiser_camera_lastTransform then
+        return
+    end
+    AttachCameraTo(0)
+    SetCameraTransform(fallenEmpireCruiser_camera_lastTransform)
 end
 
 ------------------------------------------------
@@ -1543,12 +1596,8 @@ local fallenEmpireCruiser_attitudeControl_kP_pitch = 2.0
 local fallenEmpireCruiser_attitudeControl_maxYawSpeed = 90.0
 local fallenEmpireCruiser_attitudeControl_maxPitchSpeed = 60.0
 
-local fallenEmpireCruiser_attitudeControl_roll_kP = 42.0
-local fallenEmpireCruiser_attitudeControl_roll_kD = 5.0
-local fallenEmpireCruiser_attitudeControl_roll_speed = 1.0
-
 -- 服务端状态（vehicleId -> st）
--- st = { driverId=number, body=handle, t=number, aimYaw=number, aimPitch=number, refUp=Vec }
+-- st = { driverId=number, body=handle, t=number, aimYaw=number, aimPitch=number }
 local fallenEmpireCruiser_attitudeControl_serverVehicleStates = {}
 
 local function fallenEmpireCruiser_attitudeControl_clamp(v, a, b)
@@ -1656,7 +1705,7 @@ function fallenEmpireCruiser_attitudeControl_ReportCameraDir(playerId, dx, dy, d
 
     local st = fallenEmpireCruiser_attitudeControl_serverVehicleStates[veh]
     if not st then
-        st = { driverId = playerId, body = 0, t = -999, aimYaw = 0, aimPitch = 0, refUp = nil }
+        st = { driverId = playerId, body = 0, t = -999, aimYaw = 0, aimPitch = 0 }
         fallenEmpireCruiser_attitudeControl_serverVehicleStates[veh] = st
     end
 
@@ -1718,35 +1767,6 @@ local function fallenEmpireCruiser_attitudeControl_server_applyRotation(dt)
                         local localAngVel = Vec(pitchSpeedRad, yawSpeedRad, 0)
                         local worldAngVel = TransformToParentVec(t, localAngVel)
                         SetBodyAngularVelocity(body, worldAngVel)
-
-                        -- Roll 自动回正（PD 控制版，参考 test4.lua）
-                        if not st.refUp then
-                            local worldUp = Vec(0, 1, 0)
-                            local currentUp = VecNormalize(TransformToParentVec(t, Vec(0, 1, 0)))
-                            if VecDot(currentUp, worldUp) < 0 then
-                                st.refUp = VecScale(currentUp, -1)
-                            else
-                                st.refUp = currentUp
-                            end
-                        else
-                            local upNow = VecNormalize(TransformToParentVec(t, Vec(0, 1, 0)))
-                            local forwardNow = VecNormalize(TransformToParentVec(t, Vec(0, 0, -1)))
-                            local errorAxis = VecCross(upNow, st.refUp)
-                            local rollError = VecDot(errorAxis, forwardNow)
-
-                            if math.abs(rollError) >= 0.0005 then
-                                local angVel = GetBodyAngularVelocity(body)
-                                local currentRollSpeed = VecDot(angVel, forwardNow)
-
-                                local desiredRollSpeed = rollError * fallenEmpireCruiser_attitudeControl_roll_kP * fallenEmpireCruiser_attitudeControl_roll_speed
-                                local damping = -currentRollSpeed * fallenEmpireCruiser_attitudeControl_roll_kD
-                                local rollCorrection = desiredRollSpeed + damping
-                                local correctionVec = VecScale(forwardNow, rollCorrection)
-
-                                local newAngVel = VecAdd(angVel, VecScale(correctionVec, dt or 0))
-                                SetBodyAngularVelocity(body, newAngVel)
-                            end
-                        end
                     end
                 end
             end
@@ -1760,6 +1780,117 @@ end
 
 ------------------------------------------------
 -- fallenEmpireCruiser_attitudeControl 模块 结束
+------------------------------------------------
+
+------------------------------------------------
+-- fallenEmpireCruiser_stabilizeShipRoll 模块 开始
+------------------------------------------------
+
+-- PD 参数（可调）
+local fallenEmpireCruiser_stabilizeShipRoll_kP = 35.0
+local fallenEmpireCruiser_stabilizeShipRoll_kD = 6.0
+
+-- “施加转向力”的力臂长度（世界单位）：越大越容易回正，但也更“硬”
+local fallenEmpireCruiser_stabilizeShipRoll_arm = 3.5
+
+-- 最大扭矩（单位是“近似扭矩”，最终会换算成冲量对）；防止过冲
+local fallenEmpireCruiser_stabilizeShipRoll_maxTorque = 6000.0
+
+-- 死区：误差很小时不处理，避免抖动
+local fallenEmpireCruiser_stabilizeShipRoll_deadZoneRad = 0.002
+
+
+-- fallenEmpireCruiser_stabilizeShipRoll_clamp 描述：夹取
+local function fallenEmpireCruiser_stabilizeShipRoll_clamp (x, a, b)
+    if x < a then return a end
+    if x > b then return b end
+    return x
+end
+
+-- fallenEmpireCruiser_stabilizeShipRoll_projOnPlane 描述：将 v 投影到“法向为 n 的平面”上
+local function fallenEmpireCruiser_stabilizeShipRoll_projOnPlane (v, n)
+    return VecSub(v, VecScale(n, VecDot(v, n)))
+end
+
+-- fallenEmpireCruiser_stabilizeShipRoll_apply 描述：对单个飞船 body 施加 roll 回正（PD 控制，使用冲量对产生扭矩）
+local function fallenEmpireCruiser_stabilizeShipRoll_apply (body, dt)
+    if not body or body == 0 then
+        return
+    end
+
+    dt = dt or 0
+    if dt <= 0 then
+        return
+    end
+
+    local t = GetBodyTransform(body)
+    local forwardNow = VecNormalize(TransformToParentVec(t, Vec(0, 0, -1)))
+    local upNow = VecNormalize(TransformToParentVec(t, Vec(0, 1, 0)))
+    local rightNow = VecNormalize(TransformToParentVec(t, Vec(1, 0, 0)))
+
+    -- 目标：让飞船 up 尽量对齐世界上方，但只修正“绕 forward 的滚转”
+    local worldUp = Vec(0, 1, 0)
+
+    local upPlanar = fallenEmpireCruiser_stabilizeShipRoll_projOnPlane(upNow, forwardNow)
+    local worldUpPlanar = fallenEmpireCruiser_stabilizeShipRoll_projOnPlane(worldUp, forwardNow)
+    local upLen = VecLength(upPlanar)
+    local wLen = VecLength(worldUpPlanar)
+    if upLen < 0.0001 or wLen < 0.0001 then
+        return
+    end
+    upPlanar = VecScale(upPlanar, 1 / upLen)
+    worldUpPlanar = VecScale(worldUpPlanar, 1 / wLen)
+
+    -- 计算绕 forward 的有符号 roll 误差（弧度）
+    local sinPhi = VecDot(forwardNow, VecCross(upPlanar, worldUpPlanar))
+    local cosPhi = fallenEmpireCruiser_stabilizeShipRoll_clamp(VecDot(upPlanar, worldUpPlanar), -1.0, 1.0)
+    local rollError = math.atan2(sinPhi, cosPhi)
+
+    if math.abs(rollError) < fallenEmpireCruiser_stabilizeShipRoll_deadZoneRad then
+        return
+    end
+
+    local angVel = GetBodyAngularVelocity(body)
+    local rollRate = VecDot(angVel, forwardNow)
+
+    -- PD：扭矩指令（正负代表绕 forward 的方向）
+    local torqueCmd = (-rollError * fallenEmpireCruiser_stabilizeShipRoll_kP) - (rollRate * fallenEmpireCruiser_stabilizeShipRoll_kD)
+    torqueCmd = fallenEmpireCruiser_stabilizeShipRoll_clamp(torqueCmd, -fallenEmpireCruiser_stabilizeShipRoll_maxTorque, fallenEmpireCruiser_stabilizeShipRoll_maxTorque)
+
+    local arm = math.max(0.1, fallenEmpireCruiser_stabilizeShipRoll_arm)
+    local force = torqueCmd / (2.0 * arm)
+    local impulseMag = force * dt
+
+    -- 质心世界坐标
+    local comLocal = GetBodyCenterOfMass(body)
+    local comWorld = TransformToParentPoint(t, comLocal)
+
+    -- 在质心左右施加一对反向冲量：产生绕 forward 的扭矩，净力为 0
+    local p1 = VecAdd(comWorld, VecScale(rightNow, arm))
+    local p2 = VecSub(comWorld, VecScale(rightNow, arm))
+
+    local impulse = VecScale(upNow, impulseMag)
+    ApplyBodyImpulse(body, p1, impulse)
+    ApplyBodyImpulse(body, p2, VecScale(impulse, -1))
+end
+
+-- fallenEmpireCruiser_stabilizeShipRoll_server_tick 描述：服务端 tick（对飞船施加 roll 回正）
+local function fallenEmpireCruiser_stabilizeShipRoll_server_tick (dt)
+    if shipBody and shipBody ~= 0 then
+        fallenEmpireCruiser_stabilizeShipRoll_apply(shipBody, dt)
+        return
+    end
+
+    local okFind, bodies = pcall(FindBodies, "ship", true)
+    if okFind and type(bodies) == "table" then
+        for i = 1, #bodies do
+            fallenEmpireCruiser_stabilizeShipRoll_apply(bodies[i], dt)
+        end
+    end
+end
+
+------------------------------------------------
+-- fallenEmpireCruiser_stabilizeShipRoll 模块 结束
 ------------------------------------------------
 
 ------------------------------------------------
@@ -1940,6 +2071,7 @@ function client.tick(dt)
 end
 
 function client.draw()
+    fallenEmpireCruiser_camera_client_draw()
     fallenEmpireCruiser_crosshair_client_draw()
 end
 
@@ -1949,6 +2081,7 @@ local function server_tick_main(dt)
     MSlot_server_tick(dt or 0)
     fallenEmpireCruiser_move_server_tick(dt or 0)
     fallenEmpireCruiser_attitudeControl_server_tick(dt or 0)
+    fallenEmpireCruiser_stabilizeShipRoll_server_tick(dt or 0)
     DebugWatch("serverTime", serverTime)
     DebugWatch("server_useClientCallZeroBroadcast", server_useClientCallZeroBroadcast)
 end
