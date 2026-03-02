@@ -418,6 +418,288 @@ end
 ------------------------------------------------
 
 ------------------------------------------------
+-- MSlot 模块 开始
+------------------------------------------------
+
+-- 槽位数量（固定 4 个 M 槽）
+local MSlot_slotCount = 4
+
+-- 冷却时间（秒）
+local MSlot_cooldownTime = 3.0
+
+-- 导弹 XML 路径
+local MSlot_missileXmlPath = "MOD/missile/missile.xml"
+
+-- 导弹发射挂点（飞船本地坐标）
+local MSlot_missileSpawnLocal = Vec(0, 8, 0)
+
+-- 导弹仰角限制（度），相对飞船本地 Y 轴，正负对称
+local MSlot_missilePitchLimit = 30.0
+
+-- 音效：距离阈值（用于近/远音效切换）
+local MSlot_audio_nearDistance = 60.0
+local MSlot_audio_volume = 5.0
+
+-- 客户端：音效资源
+local MSlot_client_fireSounds_near = {}
+local MSlot_client_fireSounds_far = {}
+
+-- 服务端：每艘飞船的冷却
+-- st = { cooldowns={ [1]=number, [2]=number, [3]=number, [4]=number } }
+local MSlot_serverVehicleStates = {}
+
+
+-- 工具：夹取
+local function MSlot_clamp (v, a, b)
+    if v < a then return a end
+    if v > b then return b end
+    return v
+end
+
+-- 客户端：从列表里随机挑一个音效播放
+local function MSlot_client_sound_pickAndPlay (list, pos, vol)
+    if not pos then return end
+    if not list or #list == 0 then return end
+    local idx = math.random(1, #list)
+    local s = list[idx]
+    if s then
+        PlaySound(s, pos, vol)
+    end
+end
+
+-- 客户端：接收服务端广播后播放发射音效（近/远）
+local function MSlot_client_playLaunchSound (pos)
+    if not pos then return end
+    local pT = GetPlayerTransform()
+    local d = VecLength(VecSub(pos, pT.pos))
+    if d <= MSlot_audio_nearDistance then
+        MSlot_client_sound_pickAndPlay(MSlot_client_fireSounds_near, pos, MSlot_audio_volume)
+    else
+        MSlot_client_sound_pickAndPlay(MSlot_client_fireSounds_far, pos, MSlot_audio_volume)
+    end
+end
+
+-- 客户端函数：客户端检测用户是否点击 g 键。如果点击，就向服务器发送请求（同时上传摄像机前向用于服务端裁决方向）
+local function MSlot_client_tryRequestFire ()
+    if not InputPressed("g") then
+        return
+    end
+    if localPlayerId == -1 then
+        return
+    end
+
+    local myVeh = GetPlayerVehicle()
+    if not myVeh or myVeh == 0 then
+        return
+    end
+    if not HasTag(myVeh, "ship") then
+        return
+    end
+
+    local camT = GetCameraTransform()
+    local camForward = TransformToParentVec(camT, Vec(0, 0, -1))
+    camForward = VecNormalize(camForward)
+
+    ServerCall(
+        "MSlot_ServerRequestFire",
+        localPlayerId,
+        camForward[1], camForward[2], camForward[3]
+    )
+end
+
+-- 服务端：获取或创建某艘飞船的 MSlot 状态
+local function MSlot_server_getOrCreateState (veh)
+    local st = MSlot_serverVehicleStates[veh]
+    if st then
+        return st
+    end
+
+    st = {
+        cooldowns = {
+            [1] = 0,
+            [2] = 0,
+            [3] = 0,
+            [4] = 0,
+        },
+    }
+
+    MSlot_serverVehicleStates[veh] = st
+    return st
+end
+
+-- 服务端：根据“客户端上传的摄像机前向”计算导弹发射方向（世界坐标），并限制仰角
+local function MSlot_server_getMissileLaunchDirection (shipBodyHandle, camFx, camFy, camFz)
+    if not shipBodyHandle or shipBodyHandle == 0 then
+        return Vec(0, 0, -1)
+    end
+
+    local shipT = GetBodyTransform(shipBodyHandle)
+
+    local camForward = Vec(camFx or 0, camFy or 0, camFz or 0)
+    if VecLength(camForward) < 0.001 then
+        camForward = TransformToParentVec(shipT, Vec(0, 0, -1))
+    end
+    camForward = VecNormalize(camForward)
+
+    -- 转换到飞船本地坐标系
+    local localDir = TransformToLocalVec(shipT, camForward)
+
+    -- 在本地坐标系下计算水平分量长度（X-Z 平面）和仰角
+    local horzLen = math.sqrt(localDir[1] * localDir[1] + localDir[3] * localDir[3])
+    local elevation = math.deg(math.atan2(localDir[2], horzLen))
+
+    -- 限制仰角到合法范围
+    elevation = MSlot_clamp(elevation, -MSlot_missilePitchLimit, MSlot_missilePitchLimit)
+    local elevRad = math.rad(elevation)
+
+    -- 用夹角后的仰角重建本地方向向量，保持原来的 X-Z 比例
+    local newLocalDir
+    if horzLen < 0.0001 then
+        newLocalDir = Vec(0, math.sin(elevRad), -math.cos(elevRad))
+    else
+        local hx = localDir[1] / horzLen
+        local hz = localDir[3] / horzLen
+        newLocalDir = Vec(
+            hx * math.cos(elevRad),
+            math.sin(elevRad),
+            hz * math.cos(elevRad)
+        )
+    end
+
+    return VecNormalize(TransformToParentVec(shipT, newLocalDir))
+end
+
+-- 服务端：广播导弹发射位置给所有客户端
+local function MSlot_server_broadcastMissileFired (pos)
+    if not pos then
+        return
+    end
+
+    if server_useClientCallZeroBroadcast then
+        ClientCall(0, "MSlot_ClientMissileFired", pos[1], pos[2], pos[3])
+        return
+    end
+
+    local players = GetAllPlayers()
+    for i = 1, #players do
+        local p = players[i]
+        if IsPlayerValid(p) then
+            ClientCall(p, "MSlot_ClientMissileFired", pos[1], pos[2], pos[3])
+        end
+    end
+end
+
+-- 服务端：在飞船指定挂点 Spawn 导弹，并返回发射位置
+local function MSlot_server_spawnMissileFromShip (shipBodyHandle, camFx, camFy, camFz)
+    if not shipBodyHandle or shipBodyHandle == 0 then
+        return nil
+    end
+
+    local shipT = GetBodyTransform(shipBodyHandle)
+
+    local missilePos = TransformToParentPoint(shipT, MSlot_missileSpawnLocal)
+    local launchDir = MSlot_server_getMissileLaunchDirection(shipBodyHandle, camFx, camFy, camFz)
+    local missileRot = QuatLookAt(missilePos, VecAdd(missilePos, launchDir))
+    local missileT = Transform(missilePos, missileRot)
+
+    local handles = Spawn(MSlot_missileXmlPath, missileT)
+
+    local missileBody = 0
+    for i = 1, #handles do
+        if GetEntityType(handles[i]) == "body" then
+            missileBody = handles[i]
+            break
+        end
+    end
+
+    if missileBody ~= 0 then
+        SetTag(missileBody, "owner_body", tostring(shipBodyHandle))
+    end
+
+    return missilePos
+end
+
+-- 服务端函数：维护 4 槽冷却，接收客户端请求后找到第一个冷却为 0 的槽位并发射导弹
+function MSlot_ServerRequestFire (playerId, camFx, camFy, camFz)
+    if not IsPlayerValid(playerId) then
+        return
+    end
+
+    local ok, veh = pcall(GetPlayerVehicle, playerId)
+    if (not ok) or (not veh) or veh == 0 then
+        return
+    end
+    if not HasTag(veh, "ship") then
+        return
+    end
+
+    local body = GetVehicleBody(veh)
+    if not body or body == 0 then
+        return
+    end
+
+    local st = MSlot_server_getOrCreateState(veh)
+
+    for i = 1, MSlot_slotCount do
+        if (st.cooldowns[i] or 0) <= 0 then
+            local pos = MSlot_server_spawnMissileFromShip(body, camFx, camFy, camFz)
+            if not pos then
+                return
+            end
+            st.cooldowns[i] = MSlot_cooldownTime
+            MSlot_server_broadcastMissileFired(pos)
+            return
+        end
+    end
+end
+
+-- RPC：server -> client
+function MSlot_ClientMissileFired (x, y, z)
+    local pos = Vec(x, y, z)
+    MSlot_client_playLaunchSound(pos)
+end
+
+-- 服务端 tick：递减冷却
+local function MSlot_server_tick (dt)
+    for _, st in pairs(MSlot_serverVehicleStates) do
+        for i = 1, MSlot_slotCount do
+            local cd = st.cooldowns[i] or 0
+            if cd > 0 then
+                st.cooldowns[i] = math.max(0, cd - (dt or 0))
+            end
+        end
+    end
+end
+
+-- 客户端 tick：检测输入并请求
+local function MSlot_client_tick (dt)
+    MSlot_client_tryRequestFire()
+end
+
+-- 服务端 init
+local function MSlot_server_init ()
+    MSlot_serverVehicleStates = {}
+end
+
+-- 客户端 init：加载音效资源
+local function MSlot_client_init ()
+    MSlot_client_fireSounds_near = {
+        LoadSound("MOD/audio/missile_fire_01.ogg"),
+        LoadSound("MOD/audio/missile_fire_02.ogg"),
+    }
+
+    MSlot_client_fireSounds_far = {
+        LoadSound("MOD/audio/distance_missile_fire_01.ogg"),
+        LoadSound("MOD/audio/distance_missile_fire_02.ogg"),
+        LoadSound("MOD/audio/distance_missile_fire_03.ogg"),
+    }
+end
+
+------------------------------------------------
+-- MSlot 模块 结束
+------------------------------------------------
+
+------------------------------------------------
 -- 网络/输入模块 开始
 ------------------------------------------------
 
@@ -441,6 +723,7 @@ local function client_tick_main(dt)
     dt = dt or (1 / math.max(1, GetFps()))
     client_refreshLocalPlayerId()
     xSlot_client_tick(dt)
+    MSlot_client_tick(dt)
     fallenEmpireCruiser_move_client_tick(dt)
     fallenEmpireCruiser_engineDraw_client_tick(dt)
     fallenEmpireCruiser_shipWorld_client_tick(dt)
@@ -1565,6 +1848,9 @@ function server.init()
     -- xSlot 模块初始化
     xSlot_server_init()
 
+    -- MSlot 模块初始化
+    MSlot_server_init()
+
     -- fallenEmpireCruiser_move 模块初始化
     fallenEmpireCruiser_move_serverVehicleStates = {}
 
@@ -1639,6 +1925,9 @@ function client.init()
 
     -- xSlot 模块初始化
     xSlot_client_init()
+
+    -- MSlot 模块初始化
+    MSlot_client_init()
 end
 
 ------------------------------------------------
@@ -1657,6 +1946,7 @@ end
 local function server_tick_main(dt)
     serverTime = serverTime + (dt or 0)
     xSlot_server_tick(dt or 0)
+    MSlot_server_tick(dt or 0)
     fallenEmpireCruiser_move_server_tick(dt or 0)
     fallenEmpireCruiser_attitudeControl_server_tick(dt or 0)
     DebugWatch("serverTime", serverTime)
