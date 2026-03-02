@@ -38,9 +38,6 @@ local armorShape
 -- 客户端本地玩家 id（通过 IsPlayerLocal 从 GetAllPlayers 中识别）
 local localPlayerId = -1
 
--- 服务器端：递增序号，用于调试确认（客户端回执）
-local serverClickSeq = 0
-
 -- 服务器端：时间累计（用 dt 累加，避免依赖 GetTime API）
 local serverTime = 0
 
@@ -50,41 +47,143 @@ local serverTime = 0
 local server_useClientCallZeroBroadcast = true
 
 ------------------------------------------------
--- 激光参数（可调）
+-- xSlot 模块 开始
 ------------------------------------------------
 
-local maxDist = 250
-local clientLaserDuration = 0.15
-local impactExplosionSize = 1.5
+local xSlot_weaponType_TachyonLance = "TachyonLance"
+local xSlot_defaultWeaponType = xSlot_weaponType_TachyonLance
 
-------------------------------------------------
--- 客户端激光状态（渲染用）
-------------------------------------------------
+local xSlot_slotCount = 2
 
-local clientLaserTimer = 0
-local clientLaserStart = nil
-local clientLaserEnd = nil
+-- 冷却时间（秒）
+local xSlot_cooldownTime = 1.0
 
-------------------------------------------------
--- 主武器：激光模块 开始
-------------------------------------------------
+-- 发射点/方向（飞船本地坐标）
+local xSlot_muzzleLocal = Vec(0, 0, -6)
+local xSlot_dirLocal = Vec(0, 0, -1)
 
--- 功能1：在指定位置生成激光发光粒子（必须在 tick 中调用）
-local function laser_spawnGlow(pos)
-    ParticleReset()
-    ParticleType("plain")
-    ParticleColor(0.3, 0.8, 1.0)
-    ParticleEmissive(8, 0)
-    ParticleRadius(0.05, 0)
-    ParticleGravity(0)
-    ParticleDrag(1)
-    SpawnParticle(pos, Vec(0, 0, 0), 0.08)
+-- 客户端渲染持续时间（秒）
+local xSlot_client_beamDuration = 0.15
+
+-- 音效：距离阈值（用于近/远音效切换）
+local xSlot_audio_nearDistance = 60.0
+local xSlot_audio_volume = 5.0
+
+-- 客户端：活动激光束队列
+-- beam = { t=number, weaponType=string, startPos=Vec, endPos=Vec, didHit=bool }
+local xSlot_client_activeBeams = {}
+
+-- 客户端：音效资源
+local xSlot_client_fireSounds_near = {}
+local xSlot_client_fireSounds_far = {}
+local xSlot_client_hitSounds_near = {}
+local xSlot_client_hitSounds_far = {}
+
+-- 服务端：每艘飞船的武器类型与冷却
+-- st = { weaponTypes={ [1]=string, [2]=string }, cooldowns={ [1]=number, [2]=number } }
+local xSlot_serverVehicleStates = {}
+
+local function xSlot_clamp(v, a, b)
+    if v < a then return a end
+    if v > b then return b end
+    return v
 end
 
--- 功能2：绘制激光（必须在 tick 中调用）
-local function laser_draw(startPos, endPos)
-    if not startPos or not endPos then return end
+local function xSlot_weapon_getMaxDist(weaponType)
+    if weaponType == xSlot_weaponType_TachyonLance then
+        return 500
+    end
+    return 500
+end
 
+local function xSlot_weapon_getExplosionSize(weaponType)
+    if weaponType == xSlot_weaponType_TachyonLance then
+        return 4.0
+    end
+    return 2.0
+end
+
+local function xSlot_server_getOrCreateState(veh)
+    local st = xSlot_serverVehicleStates[veh]
+    if st then
+        return st
+    end
+
+    st = {
+        weaponTypes = {
+            [1] = xSlot_defaultWeaponType,
+            [2] = xSlot_defaultWeaponType,
+        },
+        cooldowns = {
+            [1] = 0,
+            [2] = 0,
+        },
+    }
+    xSlot_serverVehicleStates[veh] = st
+    return st
+end
+
+local function xSlot_client_sound_pickAndPlay(list, pos, vol)
+    if not pos then return end
+    if not list or #list == 0 then return end
+    local idx = math.random(1, #list)
+    local s = list[idx]
+    if s then
+        PlaySound(s, pos, vol)
+    end
+end
+
+local function xSlot_client_sound_playFire(weaponType, muzzleWorld)
+    if weaponType ~= xSlot_weaponType_TachyonLance then
+        return
+    end
+
+    local pT = GetPlayerTransform()
+    local d = VecLength(VecSub(muzzleWorld, pT.pos))
+    if d <= xSlot_audio_nearDistance then
+        xSlot_client_sound_pickAndPlay(xSlot_client_fireSounds_near, muzzleWorld, xSlot_audio_volume)
+    else
+        xSlot_client_sound_pickAndPlay(xSlot_client_fireSounds_far, muzzleWorld, xSlot_audio_volume)
+    end
+end
+
+local function xSlot_client_sound_playHit(weaponType, hitWorld)
+    if weaponType ~= xSlot_weaponType_TachyonLance then
+        return
+    end
+
+    local pT = GetPlayerTransform()
+    local d = VecLength(VecSub(hitWorld, pT.pos))
+    if d <= xSlot_audio_nearDistance then
+        xSlot_client_sound_pickAndPlay(xSlot_client_hitSounds_near, hitWorld, xSlot_audio_volume)
+    else
+        xSlot_client_sound_pickAndPlay(xSlot_client_hitSounds_far, hitWorld, xSlot_audio_volume)
+    end
+end
+
+local function xSlot_client_spawnLaserGlow_Tachyon(pos)
+    local radius = 0.4
+    for i = 1, 20 do
+        ParticleReset()
+        ParticleType("plain")
+        ParticleCollide(0)
+        ParticleRadius(0.03, 0.04)
+        ParticleEmissive(20, 30)
+        ParticleColor(0.0, 0.1, 1.0)
+        ParticleGravity(0)
+        ParticleAlpha(0.5, 0.5)
+
+        local offset = Vec(
+            (math.random() - 0.5) * 2 * radius,
+            (math.random() - 0.5) * 2 * radius,
+            (math.random() - 0.5) * 2 * radius
+        )
+
+        SpawnParticle(VecAdd(pos, offset), Vec(0, 0, 0), 0.15)
+    end
+end
+
+local function xSlot_client_drawBeam_Tachyon(startPos, endPos)
     local segLength = 5.0
     local jitter = 0.5
 
@@ -101,46 +200,82 @@ local function laser_draw(startPos, endPos)
 
     local last = startPos
     for i = 1, segments do
-        local t = i / segments
-        local p = VecLerp(startPos, endPos, t)
-        p = VecAdd(p, rndVec(jitter * t))
-        DrawLine(last, p, 1, 0.3, 0.8)
-        laser_spawnGlow(p)
+        local tt = i / segments
+        local p = VecLerp(startPos, endPos, tt)
+        p = VecAdd(p, rndVec(jitter * tt))
+        DrawLine(last, p, 1, 1, 1)
+        xSlot_client_spawnLaserGlow_Tachyon(p)
         last = p
     end
 end
 
--- 功能3：客户端启动一次“激光渲染窗口”
-local function laser_client_beginRender(startPos, endPos)
-    clientLaserStart = startPos
-    clientLaserEnd = endPos
-    clientLaserTimer = clientLaserDuration
+local function xSlot_client_drawBeam(weaponType, startPos, endPos)
+    if weaponType == xSlot_weaponType_TachyonLance then
+        xSlot_client_drawBeam_Tachyon(startPos, endPos)
+        return
+    end
+    xSlot_client_drawBeam_Tachyon(startPos, endPos)
 end
 
--- 功能4：客户端每帧渲染/倒计时（tick 中调用）
-local function laser_client_update(dt)
-    if clientLaserTimer <= 0 then
+local function xSlot_client_onLaserBroadcast(weaponType, startPos, endPos, didHit)
+    table.insert(xSlot_client_activeBeams, {
+        t = xSlot_client_beamDuration,
+        weaponType = weaponType or xSlot_defaultWeaponType,
+        startPos = startPos,
+        endPos = endPos,
+        didHit = didHit and true or false,
+    })
+
+    xSlot_client_sound_playFire(weaponType, startPos)
+    if didHit then
+        xSlot_client_sound_playHit(weaponType, endPos)
+    end
+end
+
+local function xSlot_client_updateAndRender(dt)
+    for i = #xSlot_client_activeBeams, 1, -1 do
+        local b = xSlot_client_activeBeams[i]
+        b.t = (b.t or 0) - (dt or 0)
+        if b.t <= 0 then
+            table.remove(xSlot_client_activeBeams, i)
+        else
+            xSlot_client_drawBeam(b.weaponType, b.startPos, b.endPos)
+        end
+    end
+end
+
+-- 客户端主函数：检测左键并上报“发射请求”（不上传方向，方向由服务端裁决）
+local function xSlot_client_tryRequestFire()
+    if not InputPressed("lmb") then
+        return
+    end
+    if localPlayerId == -1 then
         return
     end
 
-    clientLaserTimer = clientLaserTimer - dt
-    if clientLaserTimer <= 0 then
-        clientLaserStart = nil
-        clientLaserEnd = nil
+    local myVeh = GetPlayerVehicle()
+    if not myVeh or myVeh == 0 then
+        return
+    end
+    if not HasTag(myVeh, "ship") then
         return
     end
 
-    laser_draw(clientLaserStart, clientLaserEnd)
+    ServerCall("xSlot_ServerRequestFire", localPlayerId)
 end
 
--- 功能5：服务端广播给所有客户端渲染（用 ClientCall 实现广播）
-local function laser_server_broadcastRender(startPos, endPos)
+-- 服务端：广播给所有客户端（包含：发射点、命中点、武器类型、是否命中）
+local function xSlot_server_broadcast(weaponType, startPos, endPos, didHit)
+    local didHitInt = didHit and 1 or 0
+
     if server_useClientCallZeroBroadcast then
         ClientCall(
             0,
-            "ClientRenderLaser",
+            "xSlot_ClientLaserEvent",
+            weaponType,
             startPos[1], startPos[2], startPos[3],
-            endPos[1], endPos[2], endPos[3]
+            endPos[1], endPos[2], endPos[3],
+            didHitInt
         )
         return
     end
@@ -151,33 +286,135 @@ local function laser_server_broadcastRender(startPos, endPos)
         if IsPlayerValid(p) then
             ClientCall(
                 p,
-                "ClientRenderLaser",
+                "xSlot_ClientLaserEvent",
+                weaponType,
                 startPos[1], startPos[2], startPos[3],
-                endPos[1], endPos[2], endPos[3]
+                endPos[1], endPos[2], endPos[3],
+                didHitInt
             )
         end
     end
 end
 
--- 功能6：服务端计算射线命中点（并避免打到自己）
-local function laser_server_computeRayEnd(muzzleW, fwdW)
-    if shipBody and shipBody ~= 0 then
-        QueryRejectBody(shipBody)
-    end
+-- 服务端：计算激光世界发射点/命中点，并执行命中效果
+local function xSlot_server_fireLaser(body, weaponType)
+    local maxDist = xSlot_weapon_getMaxDist(weaponType)
+    local t = GetBodyTransform(body)
+    local muzzleWorld = TransformToParentPoint(t, xSlot_muzzleLocal)
+    local dirWorld = VecNormalize(TransformToParentVec(t, xSlot_dirLocal))
 
-    fwdW = VecNormalize(fwdW)
-    local hit, hitDist = QueryRaycast(muzzleW, fwdW, maxDist)
+    QueryRejectBody(body)
+    local hit, hitDist = QueryRaycast(muzzleWorld, dirWorld, maxDist)
     local endPos
     if hit then
-        endPos = VecAdd(muzzleW, VecScale(fwdW, hitDist))
+        endPos = VecAdd(muzzleWorld, VecScale(dirWorld, hitDist))
     else
-        endPos = VecAdd(muzzleW, VecScale(fwdW, maxDist))
+        endPos = VecAdd(muzzleWorld, VecScale(dirWorld, maxDist))
     end
-    return hit, endPos
+
+    if hit and weaponType == xSlot_weaponType_TachyonLance then
+        Explosion(endPos, xSlot_weapon_getExplosionSize(weaponType))
+    end
+
+    return muzzleWorld, endPos, hit
+end
+
+-- 服务器主函数：服务端接收客户端发射请求后，按槽位冷却裁决发射
+function xSlot_ServerRequestFire(playerId)
+    if not IsPlayerValid(playerId) then
+        return
+    end
+
+    local ok, veh = pcall(GetPlayerVehicle, playerId)
+    if (not ok) or (not veh) or veh == 0 then
+        return
+    end
+    if not HasTag(veh, "ship") then
+        return
+    end
+
+    local body = GetVehicleBody(veh)
+    if not body or body == 0 then
+        return
+    end
+
+    local st = xSlot_server_getOrCreateState(veh)
+
+    -- 槽位 1
+    if (st.cooldowns[1] or 0) <= 0 then
+        local weaponType = st.weaponTypes[1] or xSlot_defaultWeaponType
+        local startPos, endPos, didHit = xSlot_server_fireLaser(body, weaponType)
+        st.cooldowns[1] = xSlot_cooldownTime
+        xSlot_server_broadcast(weaponType, startPos, endPos, didHit)
+        return
+    end
+
+    -- 槽位 2
+    if (st.cooldowns[2] or 0) <= 0 then
+        local weaponType = st.weaponTypes[2] or xSlot_defaultWeaponType
+        local startPos, endPos, didHit = xSlot_server_fireLaser(body, weaponType)
+        st.cooldowns[2] = xSlot_cooldownTime
+        xSlot_server_broadcast(weaponType, startPos, endPos, didHit)
+        return
+    end
+end
+
+-- RPC：server -> client
+function xSlot_ClientLaserEvent(weaponType, sx, sy, sz, ex, ey, ez, didHitInt)
+    local startPos = Vec(sx, sy, sz)
+    local endPos = Vec(ex, ey, ez)
+    local didHit = (didHitInt or 0) ~= 0
+    xSlot_client_onLaserBroadcast(weaponType, startPos, endPos, didHit)
+end
+
+local function xSlot_server_tick(dt)
+    for _, st in pairs(xSlot_serverVehicleStates) do
+        for i = 1, xSlot_slotCount do
+            local cd = st.cooldowns[i] or 0
+            if cd > 0 then
+                st.cooldowns[i] = math.max(0, cd - (dt or 0))
+            end
+        end
+    end
+end
+
+local function xSlot_client_tick(dt)
+    xSlot_client_tryRequestFire()
+    xSlot_client_updateAndRender(dt)
+end
+
+local function xSlot_server_init()
+    xSlot_serverVehicleStates = {}
+end
+
+local function xSlot_client_init()
+    xSlot_client_fireSounds_near = {
+        LoadSound("MOD/audio/tachyon_lance_fire_01.ogg"),
+        LoadSound("MOD/audio/tachyon_lance_fire_02.ogg"),
+        LoadSound("MOD/audio/tachyon_lance_fire_03.ogg"),
+    }
+
+    xSlot_client_fireSounds_far = {
+        LoadSound("MOD/audio/distance_tachyon_lance_fire_01.ogg"),
+        LoadSound("MOD/audio/distance_tachyon_lance_fire_02.ogg"),
+        LoadSound("MOD/audio/distance_tachyon_lance_fire_03.ogg"),
+    }
+
+    xSlot_client_hitSounds_near = {
+        LoadSound("MOD/audio/tachyon_lance_hit_01.ogg"),
+        LoadSound("MOD/audio/tachyon_lance_hit_02.ogg"),
+        LoadSound("MOD/audio/tachyon_lance_hit_03wav.ogg"),
+    }
+
+    xSlot_client_hitSounds_far = {
+        LoadSound("MOD/audio/distance_tachyon_lance_hit_01.ogg"),
+        LoadSound("MOD/audio/distance_tachyon_lance_hit_02.ogg"),
+        LoadSound("MOD/audio/distance_tachyon_lance_hit_03.ogg"),
+    }
 end
 
 ------------------------------------------------
--- 主武器：激光模块 结束
+-- xSlot 模块 结束
 ------------------------------------------------
 
 ------------------------------------------------
@@ -199,55 +436,11 @@ local function client_refreshLocalPlayerId()
     end
 end
 
--- 功能2：客户端尝试开火（按键+载具条件满足才 ServerCall）
-local function client_tryFireLaser()
-    local myVeh = GetPlayerVehicle()
-    local isInShip = (myVeh ~= 0 and myVeh == shipVeh)
-
-    DebugWatch("localPlayerId", localPlayerId)
-    DebugWatch("PlayerVehicle", myVeh)
-    DebugWatch("shipVeh", shipVeh)
-    DebugWatch("isInShip", isInShip)
-    DebugWatch("LocalLmbDown", InputDown("lmb"))
-    DebugWatch("LocalLmbPressed", InputPressed("lmb"))
-    DebugWatch("shared.lastClickPlayerId", shared.lastClickPlayerId)
-    DebugWatch("shared.lastClickSeq", shared.lastClickSeq)
-    DebugWatch("laserShape", laserShape)
-
-    if not isInShip then
-        return
-    end
-    if not InputPressed("lmb") then
-        return
-    end
-    if localPlayerId == -1 then
-        return
-    end
-    if not shipBody or shipBody == 0 then
-        DebugPrint("[test6] shipBody 无效，无法发射")
-        return
-    end
-
-    -- 计算发射点与方向：优先使用发射器 shape，否则回退为飞船朝向
-    local muzzleW, fwdW
-    if laserShape and laserShape ~= 0 then
-        local shapeT = GetShapeWorldTransform(laserShape)
-        muzzleW = TransformToParentPoint(shapeT, Vec(0, 0, 3))
-        fwdW = VecNormalize(TransformToParentVec(shapeT, Vec(0, 0, 1)))
-    else
-        local shipT = GetBodyTransform(shipBody)
-        muzzleW = TransformToParentPoint(shipT, Vec(0, 0, -6))
-        fwdW = VecNormalize(TransformToParentVec(shipT, Vec(0, 0, -1)))
-    end
-
-    ServerCall("ReportShipLmbPressed", localPlayerId, muzzleW, fwdW)
-end
-
--- 功能3：客户端 tick 总控（tick 函数只调用这个）
+-- 功能2：客户端 tick 总控（tick 函数只调用这个）
 local function client_tick_main(dt)
     dt = dt or (1 / math.max(1, GetFps()))
     client_refreshLocalPlayerId()
-    client_tryFireLaser()
+    xSlot_client_tick(dt)
     fallenEmpireCruiser_move_client_tick(dt)
     fallenEmpireCruiser_engineDraw_client_tick(dt)
     fallenEmpireCruiser_shipWorld_client_tick(dt)
@@ -256,7 +449,6 @@ local function client_tick_main(dt)
     fallenEmpireCruiser_thrusterAudio_client_tick(dt)
     fallenEmpireCruiser_camera_client_tick(dt)
     fallenEmpireCruiser_attitudeControl_client_tick(dt)
-    laser_client_update(dt)
 end
 
 ------------------------------------------------
@@ -1368,18 +1560,10 @@ function server.init()
     if shipVeh == 0 then
         DebugPrint("[test6] FindVehicle('ship') 失败：请确认 vehicle 上有 tag=ship")
     end
-
-    shared.lastClickPlayerId = -1
-    shared.lastClickSeq = 0
-    shared.lastClickTime = 0
-
-    shared.laserSeq = 0
-    shared.laserStart = Vec(0, 0, 0)
-    shared.laserEnd = Vec(0, 0, 0)
-    shared.laserDidHit = 0
-
-    serverClickSeq = 0
     serverTime = 0
+
+    -- xSlot 模块初始化
+    xSlot_server_init()
 
     -- fallenEmpireCruiser_move 模块初始化
     fallenEmpireCruiser_move_serverVehicleStates = {}
@@ -1452,19 +1636,16 @@ function client.init()
     -- fallenEmpireCruiser_engineAudio / thrusterAudio 模块初始化
     fallenEmpireCruiser_engineAudio_init()
     fallenEmpireCruiser_thrusterAudio_init()
+
+    -- xSlot 模块初始化
+    xSlot_client_init()
 end
 
 ------------------------------------------------
--- 激光发射
+-- 生命周期入口
 ------------------------------------------------
 
--- 服务端检测玩家是否按下了左键且玩家驾驶了飞船，
--- -- 满足条件则记录玩家ID到shared.lastClickPlayerId
--- -- 服务端记录
-
---
-
--- 客户端：检测本地输入并通过 ServerCall 上报到服务端
+-- 客户端 tick：只调用总控函数
 function client.tick(dt)
     client_tick_main(dt)
 end
@@ -1473,74 +1654,12 @@ function client.draw()
     fallenEmpireCruiser_crosshair_client_draw()
 end
 
-------------------------------------------------
--- RPC: client -> server
-------------------------------------------------
-
--- 注意：ServerCall 触发时，服务端执行同名的全局函数
-function ReportShipLmbPressed(playerId, muzzleW, fwdW)
-    if not IsPlayerValid(playerId) then
-        return
-    end
-
-    -- 服务端校验：只接受“正在驾驶 shipVeh 的玩家”的上报
-    local ok, veh = pcall(GetPlayerVehicle, playerId)
-    if not ok then
-        return
-    end
-    if veh ~= shipVeh then
-        return
-    end
-
-    if not muzzleW or not fwdW then
-        return
-    end
-
-    local hit, endPos = laser_server_computeRayEnd(muzzleW, fwdW)
-
-    serverClickSeq = serverClickSeq + 1
-    shared.lastClickPlayerId = playerId
-    shared.lastClickSeq = serverClickSeq
-    shared.lastClickTime = serverTime
-
-    -- 记录到 shared（仅作状态/调试；不再用 shared 触发渲染）
-    shared.laserSeq = (shared.laserSeq or 0) + 1
-    shared.laserStart = muzzleW
-    shared.laserEnd = endPos
-    shared.laserDidHit = hit and 1 or 0
-
-    -- 广播渲染给所有客户端（使用 ClientCall 逐个广播）
-    laser_server_broadcastRender(muzzleW, endPos)
-
-    -- 命中时在服务端制造爆炸，确保所有人都看到效果
-    if hit then
-        Explosion(endPos, impactExplosionSize)
-    end
-
-    -- 可选：回执给该玩家的客户端，便于 DebugWatch 对照
-    ClientCall(playerId, "AckShipLmbPressed", serverClickSeq)
-end
-
-------------------------------------------------
--- RPC: server -> client (debug ack)
-------------------------------------------------
-
-function AckShipLmbPressed(seq)
-    DebugWatch("AckShipLmbPressed", seq)
-end
-
--- RPC：server -> client，要求客户端开始渲染一次激光
-function ClientRenderLaser(sx, sy, sz, ex, ey, ez)
-    laser_client_beginRender(Vec(sx, sy, sz), Vec(ex, ey, ez))
-end
-
 local function server_tick_main(dt)
     serverTime = serverTime + (dt or 0)
+    xSlot_server_tick(dt or 0)
     fallenEmpireCruiser_move_server_tick(dt or 0)
     fallenEmpireCruiser_attitudeControl_server_tick(dt or 0)
-    DebugWatch("serverClickSeq", serverClickSeq)
     DebugWatch("serverTime", serverTime)
-    DebugWatch("shared.laserSeq", shared.laserSeq)
     DebugWatch("server_useClientCallZeroBroadcast", server_useClientCallZeroBroadcast)
 end
 
