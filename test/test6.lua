@@ -10,16 +10,1234 @@ local shipVeh
 -- 飞船Body
 local shipBody
 
+-- 武器发射器 Shape（可选，tag: primaryWeaponLauncher）
+local laserShape
+
+-- 发射器 Shape（tag: missileLauncher，存在多个）
+local missileLauncherShapes = {}
+
+-- 船体 Shape（tag: hull）
+local hullShape
+
+-- 推进器 Shape（tag: thruster，存在多个）
+local thrusterShapes = {}
+
+-- 引擎 Shape（tag: engine，存在多个）
+local engineShapes = {}
+
+-- 小推进器 Shape（tag: smallThruster，存在多个）
+local smallThrusterShapes = {}
+
+-- 灯光系统 Shape（tag: secondaryLightSystem / mainLightSystem）
+local secondaryLightSystemShape
+local mainLightSystemShape
+
+-- 装甲 Shape（tag: armor）
+local armorShape
+
+-- 客户端本地玩家 id（通过 IsPlayerLocal 从 GetAllPlayers 中识别）
+local localPlayerId = -1
+
+-- 服务器端：递增序号，用于调试确认（客户端回执）
+local serverClickSeq = 0
+
+-- 服务器端：时间累计（用 dt 累加，避免依赖 GetTime API）
+local serverTime = 0
+
+-- 服务端广播方式：
+-- false = 安全的逐个玩家 ClientCall（已验证可用）
+-- true  = 使用 ClientCall(0, ...) 作为广播（你已实测两端可见）
+local server_useClientCallZeroBroadcast = true
+
 ------------------------------------------------
--- 客户端激光变量
+-- 激光参数（可调）
 ------------------------------------------------
 
-local clientLaserStart
-local clientLaserEnd
+local maxDist = 250
+local clientLaserDuration = 0.15
+local impactExplosionSize = 1.5
+
+------------------------------------------------
+-- 客户端激光状态（渲染用）
+------------------------------------------------
+
 local clientLaserTimer = 0
+local clientLaserStart = nil
+local clientLaserEnd = nil
 
--- 服务器端输入边沿检测回退（当 InputPressed("lmb", playerId) 不可用时使用）
-local serverPrevLmbDown = {}
+------------------------------------------------
+-- 主武器：激光模块 开始
+------------------------------------------------
+
+-- 功能1：在指定位置生成激光发光粒子（必须在 tick 中调用）
+local function laser_spawnGlow(pos)
+    ParticleReset()
+    ParticleType("plain")
+    ParticleColor(0.3, 0.8, 1.0)
+    ParticleEmissive(8, 0)
+    ParticleRadius(0.05, 0)
+    ParticleGravity(0)
+    ParticleDrag(1)
+    SpawnParticle(pos, Vec(0, 0, 0), 0.08)
+end
+
+-- 功能2：绘制激光（必须在 tick 中调用）
+local function laser_draw(startPos, endPos)
+    if not startPos or not endPos then return end
+
+    local segLength = 5.0
+    local jitter = 0.5
+
+    local function rndVec(scale)
+        return Vec(
+            (math.random() - 0.5) * 4 * scale,
+            (math.random() - 0.5) * 4 * scale,
+            (math.random() - 0.5) * 4 * scale
+        )
+    end
+
+    local dist = VecLength(VecSub(endPos, startPos))
+    local segments = math.max(1, math.floor(dist / segLength + 0.5))
+
+    local last = startPos
+    for i = 1, segments do
+        local t = i / segments
+        local p = VecLerp(startPos, endPos, t)
+        p = VecAdd(p, rndVec(jitter * t))
+        DrawLine(last, p, 1, 0.3, 0.8)
+        laser_spawnGlow(p)
+        last = p
+    end
+end
+
+-- 功能3：客户端启动一次“激光渲染窗口”
+local function laser_client_beginRender(startPos, endPos)
+    clientLaserStart = startPos
+    clientLaserEnd = endPos
+    clientLaserTimer = clientLaserDuration
+end
+
+-- 功能4：客户端每帧渲染/倒计时（tick 中调用）
+local function laser_client_update(dt)
+    if clientLaserTimer <= 0 then
+        return
+    end
+
+    clientLaserTimer = clientLaserTimer - dt
+    if clientLaserTimer <= 0 then
+        clientLaserStart = nil
+        clientLaserEnd = nil
+        return
+    end
+
+    laser_draw(clientLaserStart, clientLaserEnd)
+end
+
+-- 功能5：服务端广播给所有客户端渲染（用 ClientCall 实现广播）
+local function laser_server_broadcastRender(startPos, endPos)
+    if server_useClientCallZeroBroadcast then
+        ClientCall(
+            0,
+            "ClientRenderLaser",
+            startPos[1], startPos[2], startPos[3],
+            endPos[1], endPos[2], endPos[3]
+        )
+        return
+    end
+
+    local players = GetAllPlayers()
+    for i = 1, #players do
+        local p = players[i]
+        if IsPlayerValid(p) then
+            ClientCall(
+                p,
+                "ClientRenderLaser",
+                startPos[1], startPos[2], startPos[3],
+                endPos[1], endPos[2], endPos[3]
+            )
+        end
+    end
+end
+
+-- 功能6：服务端计算射线命中点（并避免打到自己）
+local function laser_server_computeRayEnd(muzzleW, fwdW)
+    if shipBody and shipBody ~= 0 then
+        QueryRejectBody(shipBody)
+    end
+
+    fwdW = VecNormalize(fwdW)
+    local hit, hitDist = QueryRaycast(muzzleW, fwdW, maxDist)
+    local endPos
+    if hit then
+        endPos = VecAdd(muzzleW, VecScale(fwdW, hitDist))
+    else
+        endPos = VecAdd(muzzleW, VecScale(fwdW, maxDist))
+    end
+    return hit, endPos
+end
+
+------------------------------------------------
+-- 主武器：激光模块 结束
+------------------------------------------------
+
+------------------------------------------------
+-- 网络/输入模块 开始
+------------------------------------------------
+
+-- 功能1：计算本地玩家 id（通过 IsPlayerLocal 探测）
+local function client_refreshLocalPlayerId()
+    if localPlayerId ~= -1 then
+        return
+    end
+    local players = GetAllPlayers()
+    for i = 1, #players do
+        local p = players[i]
+        if IsPlayerValid(p) and IsPlayerLocal(p) then
+            localPlayerId = p
+            return
+        end
+    end
+end
+
+-- 功能2：客户端尝试开火（按键+载具条件满足才 ServerCall）
+local function client_tryFireLaser()
+    local myVeh = GetPlayerVehicle()
+    local isInShip = (myVeh ~= 0 and myVeh == shipVeh)
+
+    DebugWatch("localPlayerId", localPlayerId)
+    DebugWatch("PlayerVehicle", myVeh)
+    DebugWatch("shipVeh", shipVeh)
+    DebugWatch("isInShip", isInShip)
+    DebugWatch("LocalLmbDown", InputDown("lmb"))
+    DebugWatch("LocalLmbPressed", InputPressed("lmb"))
+    DebugWatch("shared.lastClickPlayerId", shared.lastClickPlayerId)
+    DebugWatch("shared.lastClickSeq", shared.lastClickSeq)
+    DebugWatch("laserShape", laserShape)
+
+    if not isInShip then
+        return
+    end
+    if not InputPressed("lmb") then
+        return
+    end
+    if localPlayerId == -1 then
+        return
+    end
+    if not shipBody or shipBody == 0 then
+        DebugPrint("[test6] shipBody 无效，无法发射")
+        return
+    end
+
+    -- 计算发射点与方向：优先使用发射器 shape，否则回退为飞船朝向
+    local muzzleW, fwdW
+    if laserShape and laserShape ~= 0 then
+        local shapeT = GetShapeWorldTransform(laserShape)
+        muzzleW = TransformToParentPoint(shapeT, Vec(0, 0, 3))
+        fwdW = VecNormalize(TransformToParentVec(shapeT, Vec(0, 0, 1)))
+    else
+        local shipT = GetBodyTransform(shipBody)
+        muzzleW = TransformToParentPoint(shipT, Vec(0, 0, -6))
+        fwdW = VecNormalize(TransformToParentVec(shipT, Vec(0, 0, -1)))
+    end
+
+    ServerCall("ReportShipLmbPressed", localPlayerId, muzzleW, fwdW)
+end
+
+-- 功能3：客户端 tick 总控（tick 函数只调用这个）
+local function client_tick_main(dt)
+    dt = dt or (1 / math.max(1, GetFps()))
+    client_refreshLocalPlayerId()
+    client_tryFireLaser()
+    fallenEmpireCruiser_move_client_tick(dt)
+    fallenEmpireCruiser_engineDraw_client_tick(dt)
+    fallenEmpireCruiser_shipWorld_client_tick(dt)
+    fallenEmpireCruiser_engineAudio_client_tick(dt)
+    fallenEmpireCruiser_thrusterAudio_client_tick(dt)
+    fallenEmpireCruiser_camera_client_tick(dt)
+    fallenEmpireCruiser_attitudeControl_client_tick(dt)
+    laser_client_update(dt)
+end
+
+------------------------------------------------
+-- 网络/输入模块 结束
+------------------------------------------------
+
+------------------------------------------------
+-- fallenEmpireCruiser_driverLock 模块 开始
+------------------------------------------------
+
+-- 服务端：同一艘飞船只能有一个驾驶者（跨模块共享：move / attitudeControl）
+local fallenEmpireCruiser_driverLock_byVehicle = {}
+
+local function fallenEmpireCruiser_driverLock_tryAcquire(veh, playerId)
+    if not veh or veh == 0 or not IsPlayerValid(playerId) then
+        return false
+    end
+
+    local cur = fallenEmpireCruiser_driverLock_byVehicle[veh]
+    if cur and cur ~= playerId and IsPlayerValid(cur) then
+        local ok2, veh2 = pcall(GetPlayerVehicle, cur)
+        if ok2 and veh2 == veh then
+            return false
+        end
+    end
+
+    fallenEmpireCruiser_driverLock_byVehicle[veh] = playerId
+    return true
+end
+
+local function fallenEmpireCruiser_driverLock_get(veh)
+    return fallenEmpireCruiser_driverLock_byVehicle[veh]
+end
+
+local function fallenEmpireCruiser_driverLock_clear(veh)
+    fallenEmpireCruiser_driverLock_byVehicle[veh] = nil
+end
+
+local function fallenEmpireCruiser_driverLock_server_tick(dt)
+    for veh, driverId in pairs(fallenEmpireCruiser_driverLock_byVehicle) do
+        if not veh or veh == 0 or (not driverId) or (not IsPlayerValid(driverId)) then
+            fallenEmpireCruiser_driverLock_byVehicle[veh] = nil
+        else
+            local ok, curVeh = pcall(GetPlayerVehicle, driverId)
+            if (not ok) or curVeh ~= veh then
+                fallenEmpireCruiser_driverLock_byVehicle[veh] = nil
+            end
+        end
+    end
+end
+
+------------------------------------------------
+-- fallenEmpireCruiser_driverLock 模块 结束
+------------------------------------------------
+
+------------------------------------------------
+-- fallenEmpireCruiser_move 模块 开始
+------------------------------------------------
+
+-- 推进加速度（局部 Z 轴），数值越大推进越猛
+local fallenEmpireCruiser_move_thrustAccel = 60.0
+
+-- 悬浮加速度（抵消重力用），近似取 g=10
+local fallenEmpireCruiser_move_hoverAccel = 10.0
+
+-- 线性阻力系数（用于抑制速度无限增长）
+local fallenEmpireCruiser_move_dragCoeff = 1.0
+
+-- 服务端输入过期时间（防止卡住持续推进）
+local fallenEmpireCruiser_move_inputTimeout = 0.25
+
+-- 客户端上报节流（秒）
+local fallenEmpireCruiser_move_clientSendInterval = 0.05
+
+-- 客户端本地计时（不依赖 GetTime）
+local fallenEmpireCruiser_move_clientTime = 0
+
+-- 客户端上次上报状态
+local fallenEmpireCruiser_move_clientLastSendTime = -999
+local fallenEmpireCruiser_move_clientLastW = false
+local fallenEmpireCruiser_move_clientLastS = false
+local fallenEmpireCruiser_move_clientLastInShip = false
+
+-- 服务端缓存的载具状态（vehicleId -> state）
+-- state = { driverId=number, w=bool, s=bool, t=number, body=handle, thrusters={...}, thrustersT=number }
+local fallenEmpireCruiser_move_serverVehicleStates = {}
+
+-- 功能0：判断是否是“飞船载具”（用 tag=ship 识别）
+local function fallenEmpireCruiser_move_isShipVehicle(veh)
+    if not veh or veh == 0 then
+        return false
+    end
+    local ok, has = pcall(HasTag, veh, "ship")
+    return ok and has
+end
+
+-- 功能0：获取载具 body
+local function fallenEmpireCruiser_move_getVehicleBodySafe(veh)
+    local ok, body = pcall(GetVehicleBody, veh)
+    if not ok or not body or body == 0 then
+        return 0
+    end
+    return body
+end
+
+-- 功能0：获取某艘飞船上的 thruster shapes（仅该载具内）
+local function fallenEmpireCruiser_move_collectThrustersForVehicle(veh)
+    local body = fallenEmpireCruiser_move_getVehicleBodySafe(veh)
+    if body == 0 then
+        return {}, 0
+    end
+
+    -- 优先：从 body 的 shapes 里按 tag 过滤
+    local ok, bodyShapes = pcall(GetBodyShapes, body)
+    if ok and bodyShapes then
+        local res = {}
+        for i = 1, #bodyShapes do
+            local sh = bodyShapes[i]
+            if sh and sh ~= 0 then
+                local okTag, has = pcall(HasTag, sh, "thruster")
+                if okTag and has then
+                    res[#res + 1] = sh
+                end
+            end
+        end
+        return res, body
+    end
+
+    -- 回退：全局找 thruster，再按 body 过滤
+    local all = FindShapes("thruster", true) or {}
+    local res = {}
+    for i = 1, #all do
+        local sh = all[i]
+        if sh and sh ~= 0 then
+            local okBody, shBody = pcall(GetShapeBody, sh)
+            if okBody and shBody == body then
+                res[#res + 1] = sh
+            end
+        end
+    end
+    return res, body
+end
+
+-- 功能1：客户端检测按键并向服务端上报（只上报按键状态，不决定方向）
+local function fallenEmpireCruiser_move_client_reportInput(dt)
+    fallenEmpireCruiser_move_clientTime = fallenEmpireCruiser_move_clientTime + (dt or 0)
+
+    if localPlayerId == -1 then
+        return
+    end
+
+    local myVeh = GetPlayerVehicle()
+    local isInShip = fallenEmpireCruiser_move_isShipVehicle(myVeh)
+
+    local wDown = false
+    local sDown = false
+    if isInShip then
+        wDown = InputDown("w")
+        sDown = InputDown("s")
+    end
+
+    local changed = (wDown ~= fallenEmpireCruiser_move_clientLastW)
+        or (sDown ~= fallenEmpireCruiser_move_clientLastS)
+        or (isInShip ~= fallenEmpireCruiser_move_clientLastInShip)
+
+    local due = (fallenEmpireCruiser_move_clientTime - fallenEmpireCruiser_move_clientLastSendTime) >= fallenEmpireCruiser_move_clientSendInterval
+
+    if changed or due then
+        ServerCall(
+            "fallenEmpireCruiser_move_ReportInput",
+            localPlayerId,
+            wDown and 1 or 0,
+            sDown and 1 or 0
+        )
+
+        fallenEmpireCruiser_move_clientLastSendTime = fallenEmpireCruiser_move_clientTime
+        fallenEmpireCruiser_move_clientLastW = wDown
+        fallenEmpireCruiser_move_clientLastS = sDown
+        fallenEmpireCruiser_move_clientLastInShip = isInShip
+    end
+end
+
+-- 功能2：服务端接收移动请求（RPC：client -> server）
+-- 注意：ServerCall 触发时，服务端执行同名的全局函数
+function fallenEmpireCruiser_move_ReportInput(playerId, wDown, sDown)
+    if not IsPlayerValid(playerId) then
+        return
+    end
+
+    -- 服务端校验：只接受“正在驾驶某艘 ship 飞船载具”的玩家上报
+    local ok, veh = pcall(GetPlayerVehicle, playerId)
+    if not ok then
+        return
+    end
+    if not fallenEmpireCruiser_move_isShipVehicle(veh) then
+        return
+    end
+
+    -- 跨模块单驾驶者锁（move / attitudeControl 共用）
+    if not fallenEmpireCruiser_driverLock_tryAcquire(veh, playerId) then
+        return
+    end
+
+    local st = fallenEmpireCruiser_move_serverVehicleStates[veh]
+    if not st then
+        st = { driverId = nil, w = false, s = false, t = -999, body = 0, thrusters = {}, thrustersT = -999 }
+        fallenEmpireCruiser_move_serverVehicleStates[veh] = st
+    end
+
+    -- 必须存在该载具自身的 thruster shapes，否则不做任何事情
+    if (serverTime - (st.thrustersT or -999)) > 0.5 then
+        st.thrusters, st.body = fallenEmpireCruiser_move_collectThrustersForVehicle(veh)
+        st.thrustersT = serverTime
+    end
+    if not st.thrusters or #st.thrusters == 0 then
+        return
+    end
+
+    st.driverId = playerId
+    st.w = (wDown == 1)
+    st.s = (sDown == 1)
+    st.t = serverTime
+end
+
+-- 功能3：服务端根据最新输入为飞船添加推进力（方向由服务端按飞船朝向决定）
+local function fallenEmpireCruiser_move_server_applyImpulse(dt)
+    for veh, st in pairs(fallenEmpireCruiser_move_serverVehicleStates) do
+        if not veh or veh == 0 or not st then
+            fallenEmpireCruiser_move_serverVehicleStates[veh] = nil
+        else
+            -- 驾驶者必须有效、仍在驾驶该载具、且输入未过期
+            if not st.driverId or not IsPlayerValid(st.driverId) then
+                fallenEmpireCruiser_move_serverVehicleStates[veh] = nil
+            else
+                local okVeh, curVeh = pcall(GetPlayerVehicle, st.driverId)
+                if (not okVeh) or curVeh ~= veh then
+                    fallenEmpireCruiser_move_serverVehicleStates[veh] = nil
+                elseif (serverTime - (st.t or -999)) > fallenEmpireCruiser_move_inputTimeout then
+                    fallenEmpireCruiser_move_serverVehicleStates[veh] = nil
+                else
+                    if not fallenEmpireCruiser_move_isShipVehicle(veh) then
+                        fallenEmpireCruiser_move_serverVehicleStates[veh] = nil
+                    else
+                        -- 确保 body / thrusters 可用
+                        if not st.body or st.body == 0 then
+                            st.body = fallenEmpireCruiser_move_getVehicleBodySafe(veh)
+                        end
+                        if (serverTime - (st.thrustersT or -999)) > 1.0 then
+                            st.thrusters, st.body = fallenEmpireCruiser_move_collectThrustersForVehicle(veh)
+                            st.thrustersT = serverTime
+                        end
+                        if not st.body or st.body == 0 or not st.thrusters or #st.thrusters == 0 then
+                            -- 该船没有推进器就不驱动
+                        else
+                            local t = GetBodyTransform(st.body)
+                            local mass = GetBodyMass(st.body)
+
+                            -- 悬浮：抵消重力（让飞船基本悬浮）
+                            local hoverImpulse = VecScale(Vec(0, 1, 0), mass * fallenEmpireCruiser_move_hoverAccel * dt)
+                            ApplyBodyImpulse(st.body, t.pos, hoverImpulse)
+
+                            -- 推进：根据输入在机体前后方向施加冲量（局部 Z 轴）
+                            local localAcc = Vec(0, 0, 0)
+                            if st.w then
+                                localAcc = VecAdd(localAcc, Vec(0, 0, -fallenEmpireCruiser_move_thrustAccel))
+                            end
+                            if st.s then
+                                localAcc = VecAdd(localAcc, Vec(0, 0, fallenEmpireCruiser_move_thrustAccel))
+                            end
+
+                            if localAcc[1] ~= 0 or localAcc[2] ~= 0 or localAcc[3] ~= 0 then
+                                local accWorld = TransformToParentVec(t, localAcc)
+                                local impulse = VecScale(accWorld, mass * dt)
+                                ApplyBodyImpulse(st.body, t.pos, impulse)
+                            end
+
+                            -- 简单线性阻力：与当前速度方向相反
+                            local vel = GetBodyVelocity(st.body)
+                            local speed = VecLength(vel)
+                            if speed > 0.001 then
+                                local dragImpulse = VecScale(vel, -mass * fallenEmpireCruiser_move_dragCoeff * dt)
+                                ApplyBodyImpulse(st.body, t.pos, dragImpulse)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- 功能4：客户端 tick 总控（tick 函数只调用这个）
+function fallenEmpireCruiser_move_client_tick(dt)
+    fallenEmpireCruiser_move_client_reportInput(dt)
+end
+
+-- 功能5：服务端 tick 总控（tick 函数只调用这个）
+local function fallenEmpireCruiser_move_server_tick(dt)
+    fallenEmpireCruiser_move_server_applyImpulse(dt or 0)
+end
+
+------------------------------------------------
+-- fallenEmpireCruiser_move 模块 结束
+------------------------------------------------
+
+------------------------------------------------
+-- fallenEmpireCruiser_engineDraw 模块 开始
+------------------------------------------------
+
+-- 全场扫描 shapes 的刷新间隔（秒）
+local fallenEmpireCruiser_engineDraw_refreshInterval = 1.0
+
+-- 粒子生成间隔（秒）：越小越密
+local fallenEmpireCruiser_engineDraw_spawnInterval = 0.06
+
+-- 每次生成的最大粒子数量（避免场景里太多引擎导致卡顿）
+local fallenEmpireCruiser_engineDraw_maxParticlesPerBurst = 48
+
+-- 内部状态
+local fallenEmpireCruiser_engineDraw_time = 0
+local fallenEmpireCruiser_engineDraw_nextRefreshTime = 0
+local fallenEmpireCruiser_engineDraw_spawnAccum = 0
+local fallenEmpireCruiser_engineDraw_shapes = {}
+
+-- 功能1：刷新全场 engine/thruster/smallThruster shapes 列表
+local function fallenEmpireCruiser_engineDraw_refreshShapes()
+    local combined = {}
+
+    local engines = FindShapes("engine", true) or {}
+    local thrusters = FindShapes("thruster", true) or {}
+    local smallThrusters = FindShapes("smallThruster", true) or {}
+
+    for i = 1, #engines do combined[#combined + 1] = engines[i] end
+    for i = 1, #thrusters do combined[#combined + 1] = thrusters[i] end
+    for i = 1, #smallThrusters do combined[#combined + 1] = smallThrusters[i] end
+
+    fallenEmpireCruiser_engineDraw_shapes = combined
+end
+
+-- 功能2：在一个位置生成“微微燃烧”的光晕粒子（无尾焰：速度恒为 0）
+local function fallenEmpireCruiser_engineDraw_spawnHalo(pos, intensity)
+    ParticleReset()
+    ParticleType("plain")
+    ParticleGravity(0)
+    ParticleDrag(8)
+
+    -- 轻微燃烧：偏橙黄、较高自发光、较小半径
+    local r = 1.0
+    local g = 0.55
+    local b = 0.15
+    ParticleColor(r, g, b)
+    ParticleEmissive(2.8 * intensity, 0)
+    ParticleRadius(0.06, 0)
+
+    -- 无尾焰：不赋予初速度
+    SpawnParticle(pos, Vec(0, 0, 0), 0.12)
+end
+
+-- 功能3：客户端 tick 总控（tick 函数只调用这个）
+function fallenEmpireCruiser_engineDraw_client_tick(dt)
+    fallenEmpireCruiser_engineDraw_time = fallenEmpireCruiser_engineDraw_time + (dt or 0)
+
+    if fallenEmpireCruiser_engineDraw_time >= fallenEmpireCruiser_engineDraw_nextRefreshTime then
+        fallenEmpireCruiser_engineDraw_refreshShapes()
+        fallenEmpireCruiser_engineDraw_nextRefreshTime = fallenEmpireCruiser_engineDraw_time + fallenEmpireCruiser_engineDraw_refreshInterval
+    end
+
+    fallenEmpireCruiser_engineDraw_spawnAccum = fallenEmpireCruiser_engineDraw_spawnAccum + (dt or 0)
+    if fallenEmpireCruiser_engineDraw_spawnAccum < fallenEmpireCruiser_engineDraw_spawnInterval then
+        return
+    end
+    fallenEmpireCruiser_engineDraw_spawnAccum = 0
+
+    local shapes = fallenEmpireCruiser_engineDraw_shapes
+    if not shapes or #shapes == 0 then
+        return
+    end
+
+    local maxN = math.min(#shapes, fallenEmpireCruiser_engineDraw_maxParticlesPerBurst)
+    for i = 1, maxN do
+        local sh = shapes[i]
+        if sh and sh ~= 0 then
+            local t = GetShapeWorldTransform(sh)
+
+            -- 轻微随机抖动，模拟“燃烧闪烁”，但不形成尾焰
+            local jitter = 0.03
+            local flicker = 0.7 + 0.3 * math.abs(math.sin(fallenEmpireCruiser_engineDraw_time * 9.0 + i))
+            local p = TransformToParentPoint(t, Vec(
+                (math.random() - 0.5) * 2 * jitter,
+                (math.random() - 0.5) * 2 * jitter,
+                (math.random() - 0.5) * 2 * jitter
+            ))
+            fallenEmpireCruiser_engineDraw_spawnHalo(p, flicker)
+        end
+    end
+end
+
+------------------------------------------------
+-- fallenEmpireCruiser_engineDraw 模块 结束
+------------------------------------------------
+
+------------------------------------------------
+-- fallenEmpireCruiser_localShip 模块 开始
+------------------------------------------------
+
+-- 功能1：获取“本地玩家当前驾驶的飞船”（tag=ship）上下文
+-- 返回：isDriving, veh, body, tBody, velBody
+local function fallenEmpireCruiser_localShip_get()
+    local veh = GetPlayerVehicle()
+    if not veh or veh == 0 then
+        return false, 0, 0, nil, Vec(0, 0, 0)
+    end
+
+    local okTag, has = pcall(HasTag, veh, "ship")
+    if (not okTag) or (not has) then
+        return false, 0, 0, nil, Vec(0, 0, 0)
+    end
+
+    local okBody, body = pcall(GetVehicleBody, veh)
+    if (not okBody) or (not body) or body == 0 then
+        return false, 0, 0, nil, Vec(0, 0, 0)
+    end
+
+    local t = GetBodyTransform(body)
+    local vel = GetBodyVelocity(body)
+    return true, veh, body, t, vel
+end
+
+------------------------------------------------
+-- fallenEmpireCruiser_localShip 模块 结束
+------------------------------------------------
+
+------------------------------------------------
+-- fallenEmpireCruiser_shipWorld 模块 开始
+------------------------------------------------
+
+-- 纯客户端：缓存全场 tag=ship 的 vehicles，供音频等模块使用
+local fallenEmpireCruiser_shipWorld_refreshInterval = 0.5
+local fallenEmpireCruiser_shipWorld_time = 0
+local fallenEmpireCruiser_shipWorld_nextRefreshTime = 0
+local fallenEmpireCruiser_shipWorld_bodies = {}
+
+local function fallenEmpireCruiser_shipWorld_refresh()
+    local bodies = {}
+
+    local okFind, found = pcall(FindBodies, "ship", true)
+    if okFind and type(found) == "table" then
+        bodies = found
+    else
+        -- 回退：只找一艘（即使场上多艘也不至于报错）
+        local okOne, one = pcall(FindBody, "ship", true)
+        if okOne and one and one ~= 0 then
+            bodies = { one }
+        end
+    end
+
+    fallenEmpireCruiser_shipWorld_bodies = bodies
+end
+
+function fallenEmpireCruiser_shipWorld_client_tick(dt)
+    fallenEmpireCruiser_shipWorld_time = fallenEmpireCruiser_shipWorld_time + (dt or 0)
+    if fallenEmpireCruiser_shipWorld_time >= fallenEmpireCruiser_shipWorld_nextRefreshTime then
+        fallenEmpireCruiser_shipWorld_refresh()
+        fallenEmpireCruiser_shipWorld_nextRefreshTime = fallenEmpireCruiser_shipWorld_time + fallenEmpireCruiser_shipWorld_refreshInterval
+    end
+end
+
+local function fallenEmpireCruiser_shipWorld_getVehicles()
+    -- 兼容旧调用点：返回 ship bodies
+    return fallenEmpireCruiser_shipWorld_bodies or {}
+end
+
+------------------------------------------------
+-- fallenEmpireCruiser_shipWorld 模块 结束
+------------------------------------------------
+
+------------------------------------------------
+-- fallenEmpireCruiser_engineAudio 模块 开始
+------------------------------------------------
+
+local fallenEmpireCruiser_engineAudio_loop = 0
+local fallenEmpireCruiser_engineAudio_volume = 10.0
+
+local function fallenEmpireCruiser_engineAudio_init()
+    fallenEmpireCruiser_engineAudio_loop = LoadLoop("MOD/audio/engine.ogg")
+end
+
+function fallenEmpireCruiser_engineAudio_client_tick(dt)
+    if fallenEmpireCruiser_engineAudio_loop and fallenEmpireCruiser_engineAudio_loop ~= 0 then
+        local bodies = fallenEmpireCruiser_shipWorld_getVehicles()
+        for i = 1, #bodies do
+            local body = bodies[i]
+            if body and body ~= 0 then
+                local t = GetBodyTransform(body)
+                PlayLoop(fallenEmpireCruiser_engineAudio_loop, t.pos, fallenEmpireCruiser_engineAudio_volume)
+            end
+        end
+    end
+end
+
+------------------------------------------------
+-- fallenEmpireCruiser_engineAudio 模块 结束
+------------------------------------------------
+
+------------------------------------------------
+-- fallenEmpireCruiser_thrusterAudio 模块 开始
+------------------------------------------------
+
+local fallenEmpireCruiser_thrusterAudio_loop = 0
+
+local fallenEmpireCruiser_thrusterAudio_speedForMaxVol = 30.0
+local fallenEmpireCruiser_thrusterAudio_maxVol = 5.0
+
+local function fallenEmpireCruiser_thrusterAudio_clamp(x, a, b)
+    if x < a then return a end
+    if x > b then return b end
+    return x
+end
+
+local function fallenEmpireCruiser_thrusterAudio_init()
+    fallenEmpireCruiser_thrusterAudio_loop = LoadLoop("MOD/audio/move.ogg")
+end
+
+function fallenEmpireCruiser_thrusterAudio_client_tick(dt)
+    if fallenEmpireCruiser_thrusterAudio_loop and fallenEmpireCruiser_thrusterAudio_loop ~= 0 then
+        local bodies = fallenEmpireCruiser_shipWorld_getVehicles()
+        for i = 1, #bodies do
+            local body = bodies[i]
+            if body and body ~= 0 then
+                local t = GetBodyTransform(body)
+                local vel = GetBodyVelocity(body)
+                local speed = VecLength(vel or Vec(0, 0, 0))
+                local k = fallenEmpireCruiser_thrusterAudio_clamp(speed / fallenEmpireCruiser_thrusterAudio_speedForMaxVol, 0.0, 1.0)
+                local vol = k * fallenEmpireCruiser_thrusterAudio_maxVol
+                PlayLoop(fallenEmpireCruiser_thrusterAudio_loop, t.pos, vol)
+            end
+        end
+    end
+end
+
+------------------------------------------------
+-- fallenEmpireCruiser_thrusterAudio 模块 结束
+------------------------------------------------
+
+------------------------------------------------
+-- fallenEmpireCruiser_camera 模块 开始
+------------------------------------------------
+
+local fallenEmpireCruiser_camera_atFront = false
+
+local fallenEmpireCruiser_camera_radiusBack = 18
+local fallenEmpireCruiser_camera_radiusMin = 4
+local fallenEmpireCruiser_camera_radiusMax = 40
+local fallenEmpireCruiser_camera_zoomSpeed = 5
+
+local fallenEmpireCruiser_camera_yaw = 0
+local fallenEmpireCruiser_camera_pitch = -20
+local fallenEmpireCruiser_camera_targetYaw = 0
+local fallenEmpireCruiser_camera_targetPitch = -20
+
+local fallenEmpireCruiser_camera_rotateSensitivity = 0.12
+local fallenEmpireCruiser_camera_lerpSpeed = 6
+
+-- 右键：短按切前/后视；长按（仅后视）自由观察
+local fallenEmpireCruiser_camera_rmbDown = false
+local fallenEmpireCruiser_camera_rmbHoldTime = 0
+local fallenEmpireCruiser_camera_freeLookActive = false
+local fallenEmpireCruiser_camera_longPressThreshold = 0.25
+
+function fallenEmpireCruiser_camera_isLongPressActive()
+    return fallenEmpireCruiser_camera_rmbDown and (fallenEmpireCruiser_camera_rmbHoldTime >= fallenEmpireCruiser_camera_longPressThreshold)
+end
+
+local function fallenEmpireCruiser_camera_clamp(x, a, b)
+    if x < a then return a end
+    if x > b then return b end
+    return x
+end
+
+local function fallenEmpireCruiser_camera_normalizeAngleDeg(a)
+    a = a % 360
+    if a > 180 then a = a - 360 end
+    if a < -180 then a = a + 360 end
+    return a
+end
+
+local function fallenEmpireCruiser_camera_shortestAngleDiff(from, to)
+    local d = fallenEmpireCruiser_camera_normalizeAngleDeg(to - from)
+    return d
+end
+
+local function fallenEmpireCruiser_camera_handleRmb(dt)
+    if InputPressed("rmb") then
+        fallenEmpireCruiser_camera_rmbDown = true
+        fallenEmpireCruiser_camera_rmbHoldTime = 0
+    end
+
+    if fallenEmpireCruiser_camera_rmbDown then
+        fallenEmpireCruiser_camera_rmbHoldTime = fallenEmpireCruiser_camera_rmbHoldTime + (dt or 0)
+        if (not fallenEmpireCruiser_camera_atFront)
+            and (fallenEmpireCruiser_camera_rmbHoldTime >= fallenEmpireCruiser_camera_longPressThreshold)
+            and (not fallenEmpireCruiser_camera_freeLookActive) then
+            fallenEmpireCruiser_camera_freeLookActive = true
+        end
+    end
+
+    if InputReleased("rmb") then
+        if fallenEmpireCruiser_camera_rmbHoldTime < fallenEmpireCruiser_camera_longPressThreshold then
+            fallenEmpireCruiser_camera_atFront = not fallenEmpireCruiser_camera_atFront
+            fallenEmpireCruiser_camera_freeLookActive = false
+        else
+            fallenEmpireCruiser_camera_freeLookActive = false
+        end
+        fallenEmpireCruiser_camera_rmbDown = false
+        fallenEmpireCruiser_camera_rmbHoldTime = 0
+    end
+end
+
+local function fallenEmpireCruiser_camera_update(isDriving, body, dt)
+    if not isDriving or not body or body == 0 then
+        AttachCameraTo(0)
+        return
+    end
+
+    local shipT = GetBodyTransform(body)
+
+    fallenEmpireCruiser_camera_handleRmb(dt)
+
+    local mx = InputValue("mousedx") or 0
+    local my = InputValue("mousedy") or 0
+    local wheel = InputValue("mousewheel") or 0
+
+    local camPos
+    local camRot
+
+    if fallenEmpireCruiser_camera_atFront then
+        local localOffset = Vec(0, 0, -6)
+        camPos = TransformToParentPoint(shipT, localOffset)
+        local outDir = VecSub(camPos, shipT.pos)
+        local outTarget = VecAdd(camPos, outDir)
+        camRot = QuatLookAt(camPos, outTarget)
+    else
+        if wheel ~= 0 then
+            fallenEmpireCruiser_camera_radiusBack = fallenEmpireCruiser_camera_clamp(
+                fallenEmpireCruiser_camera_radiusBack - wheel * fallenEmpireCruiser_camera_zoomSpeed,
+                fallenEmpireCruiser_camera_radiusMin,
+                fallenEmpireCruiser_camera_radiusMax
+            )
+        end
+
+        -- 简化：后视相机的角度由鼠标直接控制（自由观察时更灵敏/不回正）
+        local sens = fallenEmpireCruiser_camera_rotateSensitivity
+        if fallenEmpireCruiser_camera_freeLookActive then
+            sens = sens * 1.0
+        end
+
+        fallenEmpireCruiser_camera_targetYaw = fallenEmpireCruiser_camera_normalizeAngleDeg(fallenEmpireCruiser_camera_targetYaw - mx * sens)
+        fallenEmpireCruiser_camera_targetPitch = fallenEmpireCruiser_camera_clamp(fallenEmpireCruiser_camera_targetPitch - my * sens, -80, 80)
+
+        -- 轻微平滑（避免突然抖动）
+        local k = math.min(1.0, fallenEmpireCruiser_camera_lerpSpeed * (dt or 0))
+        local yawDelta = fallenEmpireCruiser_camera_shortestAngleDiff(fallenEmpireCruiser_camera_yaw, fallenEmpireCruiser_camera_targetYaw)
+        fallenEmpireCruiser_camera_yaw = fallenEmpireCruiser_camera_normalizeAngleDeg(fallenEmpireCruiser_camera_yaw + yawDelta * k)
+        fallenEmpireCruiser_camera_pitch = fallenEmpireCruiser_camera_pitch + (fallenEmpireCruiser_camera_targetPitch - fallenEmpireCruiser_camera_pitch) * k
+        fallenEmpireCruiser_camera_pitch = fallenEmpireCruiser_camera_clamp(fallenEmpireCruiser_camera_pitch, -80, 80)
+
+        local baseOffset = Vec(0, 0, fallenEmpireCruiser_camera_radiusBack)
+        local orbitRot = QuatEuler(fallenEmpireCruiser_camera_pitch, fallenEmpireCruiser_camera_yaw, 0)
+        local offsetWorld = QuatRotateVec(orbitRot, baseOffset)
+        camPos = VecAdd(shipT.pos, offsetWorld)
+        camRot = QuatLookAt(camPos, shipT.pos)
+    end
+
+    AttachCameraTo(0)
+    SetCameraTransform(Transform(camPos, camRot))
+end
+
+function fallenEmpireCruiser_camera_client_tick(dt)
+    local isDriving, _, body = fallenEmpireCruiser_localShip_get()
+    fallenEmpireCruiser_camera_update(isDriving, body, dt)
+end
+
+------------------------------------------------
+-- fallenEmpireCruiser_camera 模块 结束
+------------------------------------------------
+
+------------------------------------------------
+-- fallenEmpireCruiser_attitudeControl 模块 开始
+------------------------------------------------
+
+-- 客户端：不在长按右键时，上报当前摄像机朝向（前/后相机都适用）
+-- 服务端：根据上报的朝向，平滑转向并自动回正（参考 test4.lua 的实现风格）
+
+local fallenEmpireCruiser_attitudeControl_clientTime = 0
+local fallenEmpireCruiser_attitudeControl_clientLastSendTime = -999
+local fallenEmpireCruiser_attitudeControl_clientSendInterval = 0.05
+
+local fallenEmpireCruiser_attitudeControl_inputTimeout = 0.25
+
+local fallenEmpireCruiser_attitudeControl_maxPitch = 80
+local fallenEmpireCruiser_attitudeControl_maxYawOffset = 120
+
+local fallenEmpireCruiser_attitudeControl_kP_yaw = 2.0
+local fallenEmpireCruiser_attitudeControl_kP_pitch = 2.0
+local fallenEmpireCruiser_attitudeControl_maxYawSpeed = 90.0
+local fallenEmpireCruiser_attitudeControl_maxPitchSpeed = 60.0
+
+local fallenEmpireCruiser_attitudeControl_roll_kP = 42.0
+local fallenEmpireCruiser_attitudeControl_roll_kD = 5.0
+local fallenEmpireCruiser_attitudeControl_roll_speed = 1.0
+
+-- 服务端状态（vehicleId -> st）
+-- st = { driverId=number, body=handle, t=number, aimYaw=number, aimPitch=number, refUp=Vec }
+local fallenEmpireCruiser_attitudeControl_serverVehicleStates = {}
+
+local function fallenEmpireCruiser_attitudeControl_clamp(v, a, b)
+    if v < a then return a end
+    if v > b then return b end
+    return v
+end
+
+local function fallenEmpireCruiser_attitudeControl_normalizeAngleDeg(a)
+    return (a + 180) % 360 - 180
+end
+
+local function fallenEmpireCruiser_attitudeControl_shortestAngleDiff(a, b)
+    local d = (b - a + 180) % 360 - 180
+    return d
+end
+
+local function fallenEmpireCruiser_attitudeControl_getShipYaw(t)
+    local forward = TransformToParentVec(t, Vec(0, 0, -1))
+    forward = VecNormalize(forward)
+    local yawRaw = math.deg(math.atan2(-forward[3], forward[1]))
+    return fallenEmpireCruiser_attitudeControl_normalizeAngleDeg(yawRaw - 90.0)
+end
+
+local function fallenEmpireCruiser_attitudeControl_getShipPitch(t)
+    local forward = TransformToParentVec(t, Vec(0, 0, -1))
+    forward = VecNormalize(forward)
+    local horiz = math.sqrt(forward[1] * forward[1] + forward[3] * forward[3])
+    local pitch = math.deg(math.atan2(forward[2], horiz))
+    return pitch
+end
+
+local function fallenEmpireCruiser_attitudeControl_dirToYawPitch(dir)
+    dir = VecNormalize(dir)
+    local yawRaw = math.deg(math.atan2(-dir[3], dir[1]))
+    local yaw = fallenEmpireCruiser_attitudeControl_normalizeAngleDeg(yawRaw - 90.0)
+    local horiz = math.sqrt(dir[1] * dir[1] + dir[3] * dir[3])
+    local pitch = math.deg(math.atan2(dir[2], horiz))
+    pitch = fallenEmpireCruiser_attitudeControl_clamp(pitch, -fallenEmpireCruiser_attitudeControl_maxPitch, fallenEmpireCruiser_attitudeControl_maxPitch)
+    return yaw, pitch
+end
+
+function fallenEmpireCruiser_attitudeControl_client_tick(dt)
+    fallenEmpireCruiser_attitudeControl_clientTime = fallenEmpireCruiser_attitudeControl_clientTime + (dt or 0)
+
+    if localPlayerId == -1 then
+        return
+    end
+
+    local myVeh = GetPlayerVehicle()
+    local okTag, has = pcall(HasTag, myVeh, "ship")
+    if (not okTag) or (not has) then
+        return
+    end
+
+    -- 长按右键：自由观察，不上报
+    if fallenEmpireCruiser_camera_isLongPressActive() then
+        return
+    end
+
+    local due = (fallenEmpireCruiser_attitudeControl_clientTime - fallenEmpireCruiser_attitudeControl_clientLastSendTime) >= fallenEmpireCruiser_attitudeControl_clientSendInterval
+    if not due then
+        return
+    end
+
+    local camT = GetCameraTransform()
+    local camForward = TransformToParentVec(camT, Vec(0, 0, -1))
+    camForward = VecNormalize(camForward)
+
+    ServerCall(
+        "fallenEmpireCruiser_attitudeControl_ReportCameraDir",
+        localPlayerId,
+        camForward[1],
+        camForward[2],
+        camForward[3]
+    )
+
+    fallenEmpireCruiser_attitudeControl_clientLastSendTime = fallenEmpireCruiser_attitudeControl_clientTime
+end
+
+-- RPC: client -> server
+function fallenEmpireCruiser_attitudeControl_ReportCameraDir(playerId, dx, dy, dz)
+    if not IsPlayerValid(playerId) then
+        return
+    end
+
+    local okVeh, veh = pcall(GetPlayerVehicle, playerId)
+    if (not okVeh) or (not veh) or veh == 0 then
+        return
+    end
+    local okTag, has = pcall(HasTag, veh, "ship")
+    if (not okTag) or (not has) then
+        return
+    end
+
+    -- 单驾驶者锁（跨模块共享）
+    if not fallenEmpireCruiser_driverLock_tryAcquire(veh, playerId) then
+        return
+    end
+
+    local dir = Vec(dx or 0, dy or 0, dz or 0)
+    if VecLength(dir) < 0.0001 then
+        return
+    end
+
+    local st = fallenEmpireCruiser_attitudeControl_serverVehicleStates[veh]
+    if not st then
+        st = { driverId = playerId, body = 0, t = -999, aimYaw = 0, aimPitch = 0, refUp = nil }
+        fallenEmpireCruiser_attitudeControl_serverVehicleStates[veh] = st
+    end
+
+    local okBody, body = pcall(GetVehicleBody, veh)
+    if (not okBody) or (not body) or body == 0 then
+        return
+    end
+
+    st.driverId = playerId
+    st.body = body
+    st.t = serverTime
+
+    local shipT = GetBodyTransform(body)
+    local aimYaw, aimPitch = fallenEmpireCruiser_attitudeControl_dirToYawPitch(dir)
+
+    -- 限制相对偏航，避免绕到背后导致翻转
+    local currentYaw = fallenEmpireCruiser_attitudeControl_getShipYaw(shipT)
+    local yawDiff = fallenEmpireCruiser_attitudeControl_shortestAngleDiff(currentYaw, aimYaw)
+    yawDiff = fallenEmpireCruiser_attitudeControl_clamp(yawDiff, -fallenEmpireCruiser_attitudeControl_maxYawOffset, fallenEmpireCruiser_attitudeControl_maxYawOffset)
+    st.aimYaw = fallenEmpireCruiser_attitudeControl_normalizeAngleDeg(currentYaw + yawDiff)
+    st.aimPitch = aimPitch
+end
+
+local function fallenEmpireCruiser_attitudeControl_server_applyRotation(dt)
+    for veh, st in pairs(fallenEmpireCruiser_attitudeControl_serverVehicleStates) do
+        if not veh or veh == 0 or (not st) then
+            fallenEmpireCruiser_attitudeControl_serverVehicleStates[veh] = nil
+        else
+            if not st.driverId or not IsPlayerValid(st.driverId) then
+                fallenEmpireCruiser_attitudeControl_serverVehicleStates[veh] = nil
+            else
+                local okVeh, curVeh = pcall(GetPlayerVehicle, st.driverId)
+                if (not okVeh) or curVeh ~= veh then
+                    fallenEmpireCruiser_attitudeControl_serverVehicleStates[veh] = nil
+                elseif (serverTime - (st.t or -999)) > fallenEmpireCruiser_attitudeControl_inputTimeout then
+                    -- 超时：不再继续转向
+                else
+                    local body = st.body
+                    if not body or body == 0 then
+                        local okBody, b = pcall(GetVehicleBody, veh)
+                        if okBody then body = b end
+                        st.body = body
+                    end
+                    if body and body ~= 0 then
+                        local t = GetBodyTransform(body)
+
+                        -- 根据当前朝向与目标朝向误差设置角速度（Yaw+Pitch）
+                        local currentYaw = fallenEmpireCruiser_attitudeControl_getShipYaw(t)
+                        local currentPitch = fallenEmpireCruiser_attitudeControl_getShipPitch(t)
+                        local yawError = fallenEmpireCruiser_attitudeControl_shortestAngleDiff(currentYaw, st.aimYaw or 0)
+                        local pitchError = fallenEmpireCruiser_attitudeControl_clamp((st.aimPitch or 0) - currentPitch, -fallenEmpireCruiser_attitudeControl_maxPitch, fallenEmpireCruiser_attitudeControl_maxPitch)
+
+                        local yawSpeedDeg = fallenEmpireCruiser_attitudeControl_clamp(yawError * fallenEmpireCruiser_attitudeControl_kP_yaw, -fallenEmpireCruiser_attitudeControl_maxYawSpeed, fallenEmpireCruiser_attitudeControl_maxYawSpeed)
+                        local pitchSpeedDeg = fallenEmpireCruiser_attitudeControl_clamp(pitchError * fallenEmpireCruiser_attitudeControl_kP_pitch, -fallenEmpireCruiser_attitudeControl_maxPitchSpeed, fallenEmpireCruiser_attitudeControl_maxPitchSpeed)
+
+                        local yawSpeedRad = yawSpeedDeg * math.pi / 180.0
+                        local pitchSpeedRad = pitchSpeedDeg * math.pi / 180.0
+
+                        local localAngVel = Vec(pitchSpeedRad, yawSpeedRad, 0)
+                        local worldAngVel = TransformToParentVec(t, localAngVel)
+                        SetBodyAngularVelocity(body, worldAngVel)
+
+                        -- Roll 自动回正（PD 控制版，参考 test4.lua）
+                        if not st.refUp then
+                            local worldUp = Vec(0, 1, 0)
+                            local currentUp = VecNormalize(TransformToParentVec(t, Vec(0, 1, 0)))
+                            if VecDot(currentUp, worldUp) < 0 then
+                                st.refUp = VecScale(currentUp, -1)
+                            else
+                                st.refUp = currentUp
+                            end
+                        else
+                            local upNow = VecNormalize(TransformToParentVec(t, Vec(0, 1, 0)))
+                            local forwardNow = VecNormalize(TransformToParentVec(t, Vec(0, 0, -1)))
+                            local errorAxis = VecCross(upNow, st.refUp)
+                            local rollError = VecDot(errorAxis, forwardNow)
+
+                            if math.abs(rollError) >= 0.0005 then
+                                local angVel = GetBodyAngularVelocity(body)
+                                local currentRollSpeed = VecDot(angVel, forwardNow)
+
+                                local desiredRollSpeed = rollError * fallenEmpireCruiser_attitudeControl_roll_kP * fallenEmpireCruiser_attitudeControl_roll_speed
+                                local damping = -currentRollSpeed * fallenEmpireCruiser_attitudeControl_roll_kD
+                                local rollCorrection = desiredRollSpeed + damping
+                                local correctionVec = VecScale(forwardNow, rollCorrection)
+
+                                local newAngVel = VecAdd(angVel, VecScale(correctionVec, dt or 0))
+                                SetBodyAngularVelocity(body, newAngVel)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function fallenEmpireCruiser_attitudeControl_server_tick(dt)
+    fallenEmpireCruiser_attitudeControl_server_applyRotation(dt or 0)
+end
+
+------------------------------------------------
+-- fallenEmpireCruiser_attitudeControl 模块 结束
+------------------------------------------------
+
+------------------------------------------------
+-- fallenEmpireCruiser_crosshair 模块 开始
+------------------------------------------------
+
+local fallenEmpireCruiser_crosshair_distance = 200
+local fallenEmpireCruiser_crosshair_size = 8
+
+function fallenEmpireCruiser_crosshair_client_draw()
+    local isDriving, _, body = fallenEmpireCruiser_localShip_get()
+    if not isDriving or not body or body == 0 then
+        return
+    end
+
+    local t = GetBodyTransform(body)
+
+    local forwardLocal = Vec(0, 0, -1)
+    local rayOrigin = TransformToParentPoint(t, VecScale(forwardLocal, 2))
+    local forwardWorldDir = TransformToParentVec(t, forwardLocal)
+    forwardWorldDir = VecNormalize(forwardWorldDir)
+
+    local hit, hitDist = QueryRaycast(rayOrigin, forwardWorldDir, fallenEmpireCruiser_crosshair_distance)
+    local forwardWorldPoint
+    if hit then
+        forwardWorldPoint = VecAdd(rayOrigin, VecScale(forwardWorldDir, hitDist))
+    else
+        forwardWorldPoint = TransformToParentPoint(t, VecScale(forwardLocal, fallenEmpireCruiser_crosshair_distance))
+    end
+
+    local camT = GetCameraTransform()
+    local camForward = TransformToParentVec(camT, Vec(0, 0, -1))
+    camForward = VecNormalize(camForward)
+    local dirToPoint = VecNormalize(VecSub(forwardWorldPoint, camT.pos))
+    local dot = VecDot(camForward, dirToPoint)
+    if dot <= 0 then
+        return
+    end
+
+    local sx, sy = UiWorldToPixel(forwardWorldPoint)
+    if not sx or not sy then
+        return
+    end
+
+    UiPush()
+        UiAlign("center middle")
+        UiTranslate(sx, sy)
+        UiColor(1, 1, 1, 1)
+        local s = fallenEmpireCruiser_crosshair_size
+        local th = 1
+        UiRect(s * 2, th)
+        UiRect(th, s * 2)
+    UiPop()
+end
+
+------------------------------------------------
+-- fallenEmpireCruiser_crosshair 模块 结束
+------------------------------------------------
 
 ------------------------------------------------
 -- 初始化
@@ -29,70 +1247,191 @@ function server.init()
     shipVeh  = FindVehicle("ship", false)
     shipBody = GetVehicleBody(shipVeh)
 
+    -- 按飞船 XML 引入所有 shape（vox 节点 tags）
+    laserShape = FindShape("primaryWeaponLauncher", false)
+    missileLauncherShapes = FindShapes("missileLauncher", false) or {}
+    hullShape = FindShape("hull", false)
+    thrusterShapes = FindShapes("thruster", false) or {}
+    engineShapes = FindShapes("engine", false) or {}
+    smallThrusterShapes = FindShapes("smallThruster", false) or {}
+    secondaryLightSystemShape = FindShape("secondaryLightSystem", false)
+    mainLightSystemShape = FindShape("mainLightSystem", false)
+    armorShape = FindShape("armor", false)
+
+    if shipVeh == 0 then
+        DebugPrint("[test6] FindVehicle('ship') 失败：请确认 vehicle 上有 tag=ship")
+    end
+
     shared.lastClickPlayerId = -1
-    shared.pilot = -1
+    shared.lastClickSeq = 0
+    shared.lastClickTime = 0
+
+    shared.laserSeq = 0
+    shared.laserStart = Vec(0, 0, 0)
+    shared.laserEnd = Vec(0, 0, 0)
+    shared.laserDidHit = 0
+
+    serverClickSeq = 0
+    serverTime = 0
+
+    -- fallenEmpireCruiser_move 模块初始化
+    fallenEmpireCruiser_move_serverVehicleStates = {}
+
+    -- fallenEmpireCruiser_driverLock / attitudeControl 模块初始化
+    fallenEmpireCruiser_driverLock_byVehicle = {}
+    fallenEmpireCruiser_attitudeControl_serverVehicleStates = {}
 end
 
 function client.init()
     shipVeh  = FindVehicle("ship", false)
     shipBody = GetVehicleBody(shipVeh)
-end
 
-------------------------------------------------
--- 激光模块
-------------------------------------------------
+    -- 按飞船 XML 引入所有 shape（vox 节点 tags）
+    laserShape = FindShape("primaryWeaponLauncher", false)
+    missileLauncherShapes = FindShapes("missileLauncher", false) or {}
+    hullShape = FindShape("hull", false)
+    thrusterShapes = FindShapes("thruster", false) or {}
+    engineShapes = FindShapes("engine", false) or {}
+    smallThrusterShapes = FindShapes("smallThruster", false) or {}
+    secondaryLightSystemShape = FindShape("secondaryLightSystem", false)
+    mainLightSystemShape = FindShape("mainLightSystem", false)
+    armorShape = FindShape("armor", false)
 
--- 服务器端:
-
-function client.tick(dt)
-    DebugWatch("PlayerVehicle", GetPlayerVehicle())
-
-    DebugWatch("PushPlayer", shared.lastClickPlayerId)
-
-    DebugWatch("shipVeh", shipVeh)
-
-    DebugWatch("clientLaserTimer", clientLaserTimer)
-    -- 本地仅用于验证：我自己是否按下了左键（不做网络发送）
-    DebugWatch("LocalLmbDown", InputDown("lmb"))
-    DebugWatch("LocalLmbPressed", InputPressed("lmb"))
-end
-
-
-function server.tick()
-    DebugWatch("server",114514)
-
-    local players = GetAllPlayers()
-    if shipVeh ~= 0 then
-        for i = 1, #players do
-            local p = players[i]
-            if IsPlayerValid(p) and IsPlayerVehicleDriver(shipVeh, p) then
-                shared.pilot = p
-                break
-            end
-        end
-    else
-        shared.pilot = -1
+    if shipVeh == 0 then
+        DebugPrint("[test6] FindVehicle('ship') 失败：请确认 vehicle 上有 tag=ship")
+    end
+    if not laserShape or laserShape == 0 then
+        DebugPrint("[test6] FindShape('primaryWeaponLauncher') 未找到：将回退为飞船朝向发射")
     end
 
-    -- PlaneMain 思路：服务器端轮询每个玩家的输入，捕获谁按下了左键
+    -- 识别本地玩家 id（不依赖可能不存在的 GetPlayerId API）
+    localPlayerId = -1
+    local players = GetAllPlayers()
     for i = 1, #players do
         local p = players[i]
-        if IsPlayerValid(p) then
-            local ok, pressed = pcall(InputPressed, "lmb", p)
-            if ok then
-                if pressed then
-                    shared.lastClickPlayerId = p
-                    break
-                end
-            else
-                local down = InputDown("lmb", p)
-                if down and not serverPrevLmbDown[p] then
-                    shared.lastClickPlayerId = p
-                    serverPrevLmbDown[p] = down
-                    break
-                end
-                serverPrevLmbDown[p] = down
-            end
+        if IsPlayerValid(p) and IsPlayerLocal(p) then
+            localPlayerId = p
+            break
         end
     end
+
+    -- fallenEmpireCruiser_move 模块初始化
+    fallenEmpireCruiser_move_clientTime = 0
+    fallenEmpireCruiser_move_clientLastSendTime = -999
+    fallenEmpireCruiser_move_clientLastW = false
+    fallenEmpireCruiser_move_clientLastS = false
+    fallenEmpireCruiser_move_clientLastInShip = false
+
+    -- fallenEmpireCruiser_engineDraw 模块初始化
+    fallenEmpireCruiser_engineDraw_time = 0
+    fallenEmpireCruiser_engineDraw_nextRefreshTime = 0
+    fallenEmpireCruiser_engineDraw_spawnAccum = 0
+    fallenEmpireCruiser_engineDraw_shapes = {}
+
+    -- fallenEmpireCruiser_shipWorld 模块初始化
+    fallenEmpireCruiser_shipWorld_time = 0
+    fallenEmpireCruiser_shipWorld_nextRefreshTime = 0
+    fallenEmpireCruiser_shipWorld_bodies = {}
+
+    -- fallenEmpireCruiser_attitudeControl 模块初始化
+    fallenEmpireCruiser_attitudeControl_clientTime = 0
+    fallenEmpireCruiser_attitudeControl_clientLastSendTime = -999
+
+    -- fallenEmpireCruiser_engineAudio / thrusterAudio 模块初始化
+    fallenEmpireCruiser_engineAudio_init()
+    fallenEmpireCruiser_thrusterAudio_init()
+end
+
+------------------------------------------------
+-- 激光发射
+------------------------------------------------
+
+-- 服务端检测玩家是否按下了左键且玩家驾驶了飞船，
+-- -- 满足条件则记录玩家ID到shared.lastClickPlayerId
+-- -- 服务端记录
+
+--
+
+-- 客户端：检测本地输入并通过 ServerCall 上报到服务端
+function client.tick(dt)
+    client_tick_main(dt)
+end
+
+function client.draw()
+    fallenEmpireCruiser_crosshair_client_draw()
+end
+
+------------------------------------------------
+-- RPC: client -> server
+------------------------------------------------
+
+-- 注意：ServerCall 触发时，服务端执行同名的全局函数
+function ReportShipLmbPressed(playerId, muzzleW, fwdW)
+    if not IsPlayerValid(playerId) then
+        return
+    end
+
+    -- 服务端校验：只接受“正在驾驶 shipVeh 的玩家”的上报
+    local ok, veh = pcall(GetPlayerVehicle, playerId)
+    if not ok then
+        return
+    end
+    if veh ~= shipVeh then
+        return
+    end
+
+    if not muzzleW or not fwdW then
+        return
+    end
+
+    local hit, endPos = laser_server_computeRayEnd(muzzleW, fwdW)
+
+    serverClickSeq = serverClickSeq + 1
+    shared.lastClickPlayerId = playerId
+    shared.lastClickSeq = serverClickSeq
+    shared.lastClickTime = serverTime
+
+    -- 记录到 shared（仅作状态/调试；不再用 shared 触发渲染）
+    shared.laserSeq = (shared.laserSeq or 0) + 1
+    shared.laserStart = muzzleW
+    shared.laserEnd = endPos
+    shared.laserDidHit = hit and 1 or 0
+
+    -- 广播渲染给所有客户端（使用 ClientCall 逐个广播）
+    laser_server_broadcastRender(muzzleW, endPos)
+
+    -- 命中时在服务端制造爆炸，确保所有人都看到效果
+    if hit then
+        Explosion(endPos, impactExplosionSize)
+    end
+
+    -- 可选：回执给该玩家的客户端，便于 DebugWatch 对照
+    ClientCall(playerId, "AckShipLmbPressed", serverClickSeq)
+end
+
+------------------------------------------------
+-- RPC: server -> client (debug ack)
+------------------------------------------------
+
+function AckShipLmbPressed(seq)
+    DebugWatch("AckShipLmbPressed", seq)
+end
+
+-- RPC：server -> client，要求客户端开始渲染一次激光
+function ClientRenderLaser(sx, sy, sz, ex, ey, ez)
+    laser_client_beginRender(Vec(sx, sy, sz), Vec(ex, ey, ez))
+end
+
+local function server_tick_main(dt)
+    serverTime = serverTime + (dt or 0)
+    fallenEmpireCruiser_move_server_tick(dt or 0)
+    fallenEmpireCruiser_attitudeControl_server_tick(dt or 0)
+    DebugWatch("serverClickSeq", serverClickSeq)
+    DebugWatch("serverTime", serverTime)
+    DebugWatch("shared.laserSeq", shared.laserSeq)
+    DebugWatch("server_useClientCallZeroBroadcast", server_useClientCallZeroBroadcast)
+end
+
+function server.tick(dt)
+    server_tick_main(dt)
 end
