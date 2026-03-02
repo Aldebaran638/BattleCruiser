@@ -251,6 +251,7 @@ local function client_tick_main(dt)
     fallenEmpireCruiser_move_client_tick(dt)
     fallenEmpireCruiser_engineDraw_client_tick(dt)
     fallenEmpireCruiser_shipWorld_client_tick(dt)
+    fallenEmpireCruiser_drivenShipBodies_client_tick(dt)
     fallenEmpireCruiser_engineAudio_client_tick(dt)
     fallenEmpireCruiser_thrusterAudio_client_tick(dt)
     fallenEmpireCruiser_camera_client_tick(dt)
@@ -733,6 +734,57 @@ end
 ------------------------------------------------
 
 ------------------------------------------------
+-- fallenEmpireCruiser_drivenShipBodies 模块 开始
+------------------------------------------------
+
+-- 纯客户端：找出“当前有人驾驶的 ship 飞船 body”，用于音频等
+local fallenEmpireCruiser_drivenShipBodies_refreshInterval = 0.1
+local fallenEmpireCruiser_drivenShipBodies_time = 0
+local fallenEmpireCruiser_drivenShipBodies_nextRefreshTime = 0
+local fallenEmpireCruiser_drivenShipBodies_bodies = {}
+
+local function fallenEmpireCruiser_drivenShipBodies_refresh()
+    local bodies = {}
+    local seen = {}
+
+    local players = GetAllPlayers() or {}
+    for i = 1, #players do
+        local p = players[i]
+        if IsPlayerValid(p) then
+            local okVeh, veh = pcall(GetPlayerVehicle, p)
+            if okVeh and veh and veh ~= 0 then
+                local okTag, has = pcall(HasTag, veh, "ship")
+                if okTag and has then
+                    local okBody, body = pcall(GetVehicleBody, veh)
+                    if okBody and body and body ~= 0 and not seen[body] then
+                        seen[body] = true
+                        bodies[#bodies + 1] = body
+                    end
+                end
+            end
+        end
+    end
+
+    fallenEmpireCruiser_drivenShipBodies_bodies = bodies
+end
+
+function fallenEmpireCruiser_drivenShipBodies_client_tick(dt)
+    fallenEmpireCruiser_drivenShipBodies_time = fallenEmpireCruiser_drivenShipBodies_time + (dt or 0)
+    if fallenEmpireCruiser_drivenShipBodies_time >= fallenEmpireCruiser_drivenShipBodies_nextRefreshTime then
+        fallenEmpireCruiser_drivenShipBodies_refresh()
+        fallenEmpireCruiser_drivenShipBodies_nextRefreshTime = fallenEmpireCruiser_drivenShipBodies_time + fallenEmpireCruiser_drivenShipBodies_refreshInterval
+    end
+end
+
+local function fallenEmpireCruiser_drivenShipBodies_get()
+    return fallenEmpireCruiser_drivenShipBodies_bodies or {}
+end
+
+------------------------------------------------
+-- fallenEmpireCruiser_drivenShipBodies 模块 结束
+------------------------------------------------
+
+------------------------------------------------
 -- fallenEmpireCruiser_engineAudio 模块 开始
 ------------------------------------------------
 
@@ -745,7 +797,7 @@ end
 
 function fallenEmpireCruiser_engineAudio_client_tick(dt)
     if fallenEmpireCruiser_engineAudio_loop and fallenEmpireCruiser_engineAudio_loop ~= 0 then
-        local bodies = fallenEmpireCruiser_shipWorld_getVehicles()
+        local bodies = fallenEmpireCruiser_drivenShipBodies_get()
         for i = 1, #bodies do
             local body = bodies[i]
             if body and body ~= 0 then
@@ -781,7 +833,7 @@ end
 
 function fallenEmpireCruiser_thrusterAudio_client_tick(dt)
     if fallenEmpireCruiser_thrusterAudio_loop and fallenEmpireCruiser_thrusterAudio_loop ~= 0 then
-        local bodies = fallenEmpireCruiser_shipWorld_getVehicles()
+        local bodies = fallenEmpireCruiser_drivenShipBodies_get()
         for i = 1, #bodies do
             local body = bodies[i]
             if body and body ~= 0 then
@@ -819,11 +871,33 @@ local fallenEmpireCruiser_camera_targetPitch = -20
 local fallenEmpireCruiser_camera_rotateSensitivity = 0.12
 local fallenEmpireCruiser_camera_lerpSpeed = 6
 
+local function fallenEmpireCruiser_camera_yawPitchFromDir(dir)
+    dir = VecNormalize(dir)
+    local yawRaw = math.deg(math.atan2(-dir[3], dir[1]))
+    local yaw = fallenEmpireCruiser_camera_normalizeAngleDeg(yawRaw - 90.0)
+    local horiz = math.sqrt(dir[1] * dir[1] + dir[3] * dir[3])
+    local pitch = math.deg(math.atan2(dir[2], horiz))
+    pitch = fallenEmpireCruiser_camera_clamp(pitch, -80, 80)
+    return yaw, pitch
+end
+
+local function fallenEmpireCruiser_camera_dirFromYawPitch(yawDeg, pitchDeg)
+    local yaw = math.rad(yawDeg)
+    local pitch = math.rad(pitchDeg)
+    local cp = math.cos(pitch)
+    local sp = math.sin(pitch)
+    -- yaw=0 面向 -Z
+    return Vec(cp * math.sin(yaw), sp, -cp * math.cos(yaw))
+end
+
 -- 右键：短按切前/后视；长按（仅后视）自由观察
 local fallenEmpireCruiser_camera_rmbDown = false
 local fallenEmpireCruiser_camera_rmbHoldTime = 0
 local fallenEmpireCruiser_camera_freeLookActive = false
 local fallenEmpireCruiser_camera_longPressThreshold = 0.25
+
+-- 切到前置相机后，下一帧用飞船朝向初始化相机 yaw/pitch（避免跳变）
+local fallenEmpireCruiser_camera_pendingInitToShipForward = false
 
 function fallenEmpireCruiser_camera_isLongPressActive()
     return fallenEmpireCruiser_camera_rmbDown and (fallenEmpireCruiser_camera_rmbHoldTime >= fallenEmpireCruiser_camera_longPressThreshold)
@@ -866,6 +940,12 @@ local function fallenEmpireCruiser_camera_handleRmb(dt)
         if fallenEmpireCruiser_camera_rmbHoldTime < fallenEmpireCruiser_camera_longPressThreshold then
             fallenEmpireCruiser_camera_atFront = not fallenEmpireCruiser_camera_atFront
             fallenEmpireCruiser_camera_freeLookActive = false
+
+            if fallenEmpireCruiser_camera_atFront then
+                fallenEmpireCruiser_camera_pendingInitToShipForward = true
+            else
+                fallenEmpireCruiser_camera_pendingInitToShipForward = false
+            end
         else
             fallenEmpireCruiser_camera_freeLookActive = false
         end
@@ -884,6 +964,17 @@ local function fallenEmpireCruiser_camera_update(isDriving, body, dt)
 
     fallenEmpireCruiser_camera_handleRmb(dt)
 
+    -- 切到前置相机的同一帧就初始化朝向，避免出现一帧跳变
+    if fallenEmpireCruiser_camera_atFront and fallenEmpireCruiser_camera_pendingInitToShipForward then
+        local shipForward = VecNormalize(TransformToParentVec(shipT, Vec(0, 0, -1)))
+        local yaw, pitch = fallenEmpireCruiser_camera_yawPitchFromDir(shipForward)
+        fallenEmpireCruiser_camera_yaw = yaw
+        fallenEmpireCruiser_camera_pitch = pitch
+        fallenEmpireCruiser_camera_targetYaw = yaw
+        fallenEmpireCruiser_camera_targetPitch = pitch
+        fallenEmpireCruiser_camera_pendingInitToShipForward = false
+    end
+
     local mx = InputValue("mousedx") or 0
     local my = InputValue("mousedy") or 0
     local wheel = InputValue("mousewheel") or 0
@@ -892,10 +983,23 @@ local function fallenEmpireCruiser_camera_update(isDriving, body, dt)
     local camRot
 
     if fallenEmpireCruiser_camera_atFront then
+        -- 前置相机：位置固定在飞船前方，但允许用鼠标旋转朝向（用作瞄准/转向输入）
         local localOffset = Vec(0, 0, -6)
         camPos = TransformToParentPoint(shipT, localOffset)
-        local outDir = VecSub(camPos, shipT.pos)
-        local outTarget = VecAdd(camPos, outDir)
+        local sens = fallenEmpireCruiser_camera_rotateSensitivity
+
+        -- 前置相机：水平转动方向与后置一致（修正反向问题）
+        fallenEmpireCruiser_camera_targetYaw = fallenEmpireCruiser_camera_normalizeAngleDeg(fallenEmpireCruiser_camera_targetYaw + mx * sens)
+        fallenEmpireCruiser_camera_targetPitch = fallenEmpireCruiser_camera_clamp(fallenEmpireCruiser_camera_targetPitch - my * sens, -80, 80)
+
+        local k = math.min(1.0, fallenEmpireCruiser_camera_lerpSpeed * (dt or 0))
+        local yawDelta = fallenEmpireCruiser_camera_shortestAngleDiff(fallenEmpireCruiser_camera_yaw, fallenEmpireCruiser_camera_targetYaw)
+        fallenEmpireCruiser_camera_yaw = fallenEmpireCruiser_camera_normalizeAngleDeg(fallenEmpireCruiser_camera_yaw + yawDelta * k)
+        fallenEmpireCruiser_camera_pitch = fallenEmpireCruiser_camera_pitch + (fallenEmpireCruiser_camera_targetPitch - fallenEmpireCruiser_camera_pitch) * k
+        fallenEmpireCruiser_camera_pitch = fallenEmpireCruiser_camera_clamp(fallenEmpireCruiser_camera_pitch, -80, 80)
+
+        local fwd = fallenEmpireCruiser_camera_dirFromYawPitch(fallenEmpireCruiser_camera_yaw, fallenEmpireCruiser_camera_pitch)
+        local outTarget = VecAdd(camPos, fwd)
         camRot = QuatLookAt(camPos, outTarget)
     else
         if wheel ~= 0 then
@@ -935,6 +1039,7 @@ end
 
 function fallenEmpireCruiser_camera_client_tick(dt)
     local isDriving, _, body = fallenEmpireCruiser_localShip_get()
+
     fallenEmpireCruiser_camera_update(isDriving, body, dt)
 end
 
@@ -1197,6 +1302,7 @@ function fallenEmpireCruiser_crosshair_client_draw()
 
     local t = GetBodyTransform(body)
 
+    -- 准星逻辑（按 test4.lua 原版）：始终沿飞船本体正前方（本地 -Z）投射
     local forwardLocal = Vec(0, 0, -1)
     local rayOrigin = TransformToParentPoint(t, VecScale(forwardLocal, 2))
     local forwardWorldDir = TransformToParentVec(t, forwardLocal)
@@ -1210,6 +1316,7 @@ function fallenEmpireCruiser_crosshair_client_draw()
         forwardWorldPoint = TransformToParentPoint(t, VecScale(forwardLocal, fallenEmpireCruiser_crosshair_distance))
     end
 
+    -- 只在“摄像机前方”时才画十字，避免在身后也出现
     local camT = GetCameraTransform()
     local camForward = TransformToParentVec(camT, Vec(0, 0, -1))
     camForward = VecNormalize(camForward)
@@ -1336,6 +1443,11 @@ function client.init()
     -- fallenEmpireCruiser_attitudeControl 模块初始化
     fallenEmpireCruiser_attitudeControl_clientTime = 0
     fallenEmpireCruiser_attitudeControl_clientLastSendTime = -999
+
+    -- fallenEmpireCruiser_drivenShipBodies 模块初始化
+    fallenEmpireCruiser_drivenShipBodies_time = 0
+    fallenEmpireCruiser_drivenShipBodies_nextRefreshTime = 0
+    fallenEmpireCruiser_drivenShipBodies_bodies = {}
 
     -- fallenEmpireCruiser_engineAudio / thrusterAudio 模块初始化
     fallenEmpireCruiser_engineAudio_init()
