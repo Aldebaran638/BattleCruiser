@@ -1,9 +1,9 @@
-name = Mod name here
-author = Your name here
-description = Informative description here
-tags = 
+name = Fallen Empire Enigmatic Battlecruiser
+author = Aldebaran638
+description = test mod
+tags = Vehicle multiplayer
 version = 2
-
+Steam ID = 76561198802960318
 # If description contains [noupload] the description on Steam workshop will not be overwritten.
 # Available tags (comma-separated):
 # Map      - A custom map with no particular gameplay

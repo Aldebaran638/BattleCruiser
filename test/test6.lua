@@ -56,7 +56,7 @@ local xSlot_defaultWeaponType = xSlot_weaponType_TachyonLance
 local xSlot_slotCount = 2
 
 -- 冷却时间（秒）
-local xSlot_cooldownTime = 1.0
+local xSlot_cooldownTime = 4.0
 
 -- 发射点/方向（飞船本地坐标）
 local xSlot_muzzleLocal = Vec(0, 0, -6)
@@ -183,7 +183,134 @@ local function xSlot_client_spawnLaserGlow_Tachyon(pos)
     end
 end
 
-local function xSlot_client_drawBeam_Tachyon(startPos, endPos)
+-- ==============================
+-- 第一层：改进版白色能量核心 快子光矛特效
+-- ==============================
+local function xSlot_client_drawBeam_Tachyon_1(startPos, endPos, radius)
+
+    radius = radius or 1.5
+
+    local dir = VecSub(endPos, startPos)
+    local length = VecLength(dir)
+    if length < 0.001 then return end
+    dir = VecNormalize(dir)
+
+    -- 构造正交基
+    local up = Vec(0,1,0)
+    if math.abs(VecDot(dir, up)) > 0.99 then
+        up = Vec(1,0,0)
+    end
+
+    local right = VecNormalize(VecCross(dir, up))
+    local forward = VecNormalize(VecCross(right, dir))
+
+    -- 轴向分层参数
+    local layersPerUnit = 8
+    local particlesPerLayer = 6
+
+    local totalLayers = math.floor(length * layersPerUnit)
+
+    for layer = 0, totalLayers do
+
+        local h = (layer / totalLayers) * length
+
+        for i = 1, particlesPerLayer do
+
+            -- 径向均匀采样
+            local r = radius * math.sqrt(math.random())
+            local theta = math.random() * math.pi * 2
+
+            local radial =
+                VecAdd(
+                    VecScale(right, r * math.cos(theta)),
+                    VecScale(forward, r * math.sin(theta))
+                )
+
+            local pos =
+                VecAdd(
+                    startPos,
+                    VecAdd(
+                        VecScale(dir, h),
+                        radial
+                    )
+                )
+
+            -- 更自然的能量衰减
+            local falloff = 1 - (r / radius)^2
+            if falloff < 0 then falloff = 0 end
+
+            ParticleReset()
+            ParticleType("plain")
+            ParticleCollide(0)
+            ParticleGravity(0)
+
+            ParticleRadius(radius * 0.22, 0)
+            ParticleEmissive(80 * falloff, 120 * falloff)
+            ParticleColor(1,1,1)
+            ParticleAlpha(0.98, 0)
+
+            -- 微弱轴向流动
+            local velocity = VecScale(dir, 2.5)
+
+            SpawnParticle(pos, velocity, 0.06)
+        end
+    end
+end
+
+-- ==============================
+-- 第二层：严格单根螺旋 快子光矛特效
+-- ==============================
+local function xSlot_client_drawBeam_Tachyon_2(startPos, endPos, radius)
+
+    local helixRadius      = (radius or 0.2) * 2.5
+    local pitch            = 15.0      -- 每旋转一圈，上升多少单位高度
+    local particlesPerUnit = 10       -- 每单位长度粒子密度
+
+    local dir = VecSub(endPos, startPos)
+    local length = VecLength(dir)
+    if length < 0.001 then return end
+    dir = VecNormalize(dir)
+
+    local up = Vec(0, 1, 0)
+    if math.abs(VecDot(dir, up)) > 0.99 then
+        up = Vec(1, 0, 0)
+    end
+
+    local right = VecNormalize(VecCross(dir, up))
+    local perp  = VecNormalize(VecCross(right, dir))
+
+    local totalParticles = math.max(2, math.floor(particlesPerUnit * length))
+
+    for i = 0, totalParticles do
+
+        local h = (i / totalParticles) * length
+
+        -- 核心区别在这里
+        local angle = 2 * math.pi * (h / pitch)
+
+        local pos = VecAdd(
+            VecAdd(startPos, VecScale(dir, h)),
+            VecAdd(
+                VecScale(right, helixRadius * math.cos(angle)),
+                VecScale(perp,  helixRadius * math.sin(angle))
+            )
+        )
+
+        ParticleReset()
+        ParticleType("plain")
+        ParticleCollide(0)
+        ParticleGravity(0)
+        ParticleRadius(0.05, 0)
+        ParticleEmissive(10, 0)
+        ParticleColor(0, 0.2, 1)
+        ParticleAlpha(0.95, 0)
+
+        SpawnParticle(pos, Vec(0,0,0), 0.08)
+    end
+end
+
+-- 聚能电弧发射器特效
+local function xSlot_client_drawBeam_focusedArcEmitters(startPos, endPos)
     local segLength = 5.0
     local jitter = 0.5
 
@@ -211,10 +338,10 @@ end
 
 local function xSlot_client_drawBeam(weaponType, startPos, endPos)
     if weaponType == xSlot_weaponType_TachyonLance then
-        xSlot_client_drawBeam_Tachyon(startPos, endPos)
+        xSlot_client_drawBeam_focusedArcEmitters(startPos, endPos)
         return
     end
-    xSlot_client_drawBeam_Tachyon(startPos, endPos)
+    xSlot_client_drawBeam_focusedArcEmitters(startPos, endPos)
 end
 
 local function xSlot_client_onLaserBroadcast(weaponType, startPos, endPos, didHit)
@@ -788,17 +915,103 @@ end
 ------------------------------------------------
 
 ------------------------------------------------
+-- antiG 模块 开始
+------------------------------------------------
+
+-- 抗重力加速度（用于抵消重力用），近似取 g=10
+local antiG_accel = 10.0
+
+-- 服务器端：获取 shipBody 的质量，并为 shipBody 施加竖直向上的抗重力“力”（以每帧冲量方式实现）
+-- shipBody: body handle
+-- dt: 秒
+local function antiG_server_apply(shipBody, dt)
+    if not shipBody or shipBody == 0 then
+        return
+    end
+
+    dt = dt or 0
+
+    local okMass, mass = pcall(GetBodyMass, shipBody)
+    if (not okMass) or (not mass) or mass == 0 then
+        return
+    end
+
+    local okT, t = pcall(GetBodyTransform, shipBody)
+    if (not okT) or (not t) then
+        return
+    end
+
+    local antiGImpulse = VecScale(Vec(0, 1, 0), mass * antiG_accel * dt)
+    ApplyBodyImpulse(shipBody, t.pos, antiGImpulse)
+end
+
+------------------------------------------------
+-- antiG 模块 结束
+------------------------------------------------
+
+------------------------------------------------
+-- pV2Damping 模块 开始
+------------------------------------------------
+
+-- 阻尼系数 p（力的大小 = p * v^2）
+-- 注：这里的“力”用每帧冲量 dt 来实现：impulse = force * dt
+local pV2Damping_p = 0.05
+
+-- 速度过小则不施加（避免抖动/除零）
+local pV2Damping_minSpeed = 0.05
+
+-- 服务器端：始终给飞船提供一个大小为 p*v^2、方向反向于飞船运动方向的力
+-- shipBody: body handle
+-- dt: 秒
+local function pV2Damping_server_apply(shipBody, dt)
+    if not shipBody or shipBody == 0 then
+        return
+    end
+
+    dt = dt or 0
+    if dt <= 0 then
+        return
+    end
+
+    local okVel, vel = pcall(GetBodyVelocity, shipBody)
+    if (not okVel) or (not vel) then
+        return
+    end
+
+    local speed = VecLength(vel)
+    if speed < pV2Damping_minSpeed then
+        return
+    end
+
+    local okT, t = pcall(GetBodyTransform, shipBody)
+    if (not okT) or (not t) then
+        return
+    end
+
+    local vDir = VecScale(vel, 1.0 / speed)
+    local mass = GetBodyMass(shipBody)
+
+    -- 你想要的“加速度大小”
+    local accelMag = pV2Damping_p * speed * speed
+
+    -- 真实物理需要的力
+    local forceMag = mass * accelMag
+
+    local force = VecScale(vDir, -forceMag)
+    local impulse = VecScale(force, dt)
+    ApplyBodyImpulse(shipBody, t.pos, impulse)
+end
+
+------------------------------------------------
+-- pV2Damping 模块 结束
+------------------------------------------------
+
+------------------------------------------------
 -- fallenEmpireCruiser_move 模块 开始
 ------------------------------------------------
 
 -- 推进加速度（局部 Z 轴），数值越大推进越猛
-local fallenEmpireCruiser_move_thrustAccel = 60.0
-
--- 悬浮加速度（抵消重力用），近似取 g=10
-local fallenEmpireCruiser_move_hoverAccel = 10.0
-
--- 线性阻力系数（用于抑制速度无限增长）
-local fallenEmpireCruiser_move_dragCoeff = 1.0
+local fallenEmpireCruiser_move_thrustAccel = 30.0
 
 -- 服务端输入过期时间（防止卡住持续推进）
 local fallenEmpireCruiser_move_inputTimeout = 0.25
@@ -990,8 +1203,7 @@ local function fallenEmpireCruiser_move_server_applyImpulse(dt)
                             local mass = GetBodyMass(st.body)
 
                             -- 悬浮：抵消重力（让飞船基本悬浮）
-                            local hoverImpulse = VecScale(Vec(0, 1, 0), mass * fallenEmpireCruiser_move_hoverAccel * dt)
-                            ApplyBodyImpulse(st.body, t.pos, hoverImpulse)
+                            -- 使用 antiG 模块处理重力抵消
 
                             -- 推进：根据输入在机体前后方向施加冲量（局部 Z 轴）
                             local localAcc = Vec(0, 0, 0)
@@ -1006,14 +1218,6 @@ local function fallenEmpireCruiser_move_server_applyImpulse(dt)
                                 local accWorld = TransformToParentVec(t, localAcc)
                                 local impulse = VecScale(accWorld, mass * dt)
                                 ApplyBodyImpulse(st.body, t.pos, impulse)
-                            end
-
-                            -- 简单线性阻力：与当前速度方向相反
-                            local vel = GetBodyVelocity(st.body)
-                            local speed = VecLength(vel)
-                            if speed > 0.001 then
-                                local dragImpulse = VecScale(vel, -mass * fallenEmpireCruiser_move_dragCoeff * dt)
-                                ApplyBodyImpulse(st.body, t.pos, dragImpulse)
                             end
                         end
                     end
@@ -2079,6 +2283,8 @@ local function server_tick_main(dt)
     serverTime = serverTime + (dt or 0)
     xSlot_server_tick(dt or 0)
     MSlot_server_tick(dt or 0)
+    antiG_server_apply(shipBody, dt)
+    pV2Damping_server_apply(shipBody, dt)
     fallenEmpireCruiser_move_server_tick(dt or 0)
     fallenEmpireCruiser_attitudeControl_server_tick(dt or 0)
     fallenEmpireCruiser_stabilizeShipRoll_server_tick(dt or 0)
