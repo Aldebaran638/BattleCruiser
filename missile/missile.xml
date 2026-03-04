@@ -1,9 +1,0 @@
-<scene>
-	<script name="missile" file="MOD/missile/test5.lua">
-		<body name="body" tags="missile" pos="0.0 2.5 18.2" dynamic="true">
-			<vox name="missile" tags="missile" pos="0.0 0.0 0.0" file="MOD/missile/test5.vox"/>
-			<vox name="missileHead" tags="missileHead" pos="0.0 0.2 -0.6" file="MOD/missile/missileHead.vox"/>
-			<vox name="launcher" tags="launcher" pos="0.0 0.3 0.5" file="MOD/missile/launcher.vox"/>
-		</body>
-	</script>
-</scene>
